@@ -1,0 +1,26 @@
+# Secrets & local state — NEVER commit these
+.env
+config.json
+memories.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Bookclub source texts loaded via !load_text — copyrighted works, keep local only
+*.html
+
+# Scratch / generated media
+scratch/
+*.mp3
+*.png
+*.wav
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

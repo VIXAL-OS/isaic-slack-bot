@@ -1,0 +1,21 @@
+# ISAIC — Slack multi-model bot
+
+# --- Slack (Socket Mode: no public URL needed) ---
+slack_bolt>=1.18.0
+slack_sdk>=3.27.0
+aiohttp>=3.9.0
+
+# --- Model SDKs ---
+anthropic>=0.50.0          # Claude (Judah)
+openai>=1.40.0             # OpenAI-compatible heads: Gemini shim, Deepseek, Mistral, Qwen, GLM, simulator
+
+# --- Features ---
+tavily-python>=0.5.0       # web search for non-native-search providers
+python-dotenv>=1.0.0
+matplotlib>=3.7.0          # LaTeX -> PNG rendering
+Pillow>=10.0.0             # compositing LaTeX PNGs
+beautifulsoup4>=4.12.0     # bookclub HTML parsing (AO3 + !load_text)
+
+# --- OPTIONAL: Gemini `vertex` backend (data residency / IAM / SLA) ---
+# Lazy-imported; only needed if providers.gemini.backend == "vertex".
+# google-cloud-aiplatform>=1.71.0

@@ -1,0 +1,27 @@
+{
+  "platform": "slack",
+  "theme": "isaic",
+  "allowed_channels": [
+    "C0123456789"
+  ],
+  "default_model": "auto",
+  "channel_preferences": {},
+
+  "_comment": "Copy to config.json. allowed_channels = Slack channel IDs the bot will respond in (invite @ISAIC to each). Get an ID from a channel's About panel or a message link. default_model: 'auto' or a provider id (claude/deepseek/gemini/mistral/qwen/glm). channel_preferences maps a channel ID to a provider id.",
+
+  "_theme_comment": "Cosmetic skin (display-only — never changes the canonical [Claude] reply label or routing). 'isaic' (default; twelve tribes !judah/!joseph/!zebulun/!naphtali/!benjamin/!gad/!levi), 'eva' (MAGI cast), or 'nightvale' (the five heads of Hiram McDaniels). Canonical bare prefixes (!claude/!deepseek/...) always work.",
+
+  "_providers_comment": "OPTIONAL. Omit 'providers' to keep defaults (each head enabled iff its API key is present, on its default backend). When present it OVERRIDES per-provider: enabled / backend / model / routing_tags, and per-backend sub-blocks (e.g. self_hosted).",
+
+  "providers": {
+    "claude":   { "enabled": true,  "model": "claude-opus-4-8", "routing_tags": ["code", "careful", "vision"] },
+    "gemini":   { "enabled": true,  "backend": "developer_api", "model": "gemini-3.1-pro-preview", "routing_tags": ["novel", "longcontext", "vision"] },
+    "deepseek": { "enabled": true,  "backend": "api", "model": "deepseek-v4-pro", "routing_tags": ["cjk", "cheap"] },
+    "mistral":  { "enabled": false, "backend": "api", "routing_tags": ["french"] },
+    "qwen":     { "enabled": false, "routing_tags": ["code", "math"] },
+    "glm":      { "enabled": false, "routing_tags": ["agentic"] },
+    "sim":      { "enabled": false },
+
+    "_backend_options": "deepseek.backend: 'api' | 'fireworks' (FIREWORKS_API_KEY) | 'self_hosted'. mistral.backend: 'api' (api.mistral.ai) | 'together' (TOGETHER_API_KEY) | 'self_hosted'. gemini.backend: 'developer_api' | 'vertex' (GCP ADC + google-cloud-aiplatform). sim: point providers.sim.base_url at a /completions endpoint and set enabled=true."
+  }
+}
