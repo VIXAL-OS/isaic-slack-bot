@@ -1,5 +1,10 @@
 # ISAIC — International System of AI Coopertition
 
+> ⚠️ **UNTESTED — work in progress.** This bot has **not been run against a live Slack workspace yet**.
+> It is syntax-validated and passes offline import/instantiation/integration checks, but the Slack
+> adapter (Socket Mode events, file uploads, threading, reactions) has had **no live smoke test**.
+> Expect to hit and fix rough edges once you wire real tokens. Not production-ready. See [Status](#status).
+
 A **Slack-native, multi-model assistant**: Claude, Gemini, and Deepseek share one bot with smart
 heuristic routing, shared two-tier memory, web search/grounding, prompt caching, and "bookclub" mode
 for discussing long texts. Open-weight heads — **Mistral**, **Qwen**, **GLM** (one Fireworks
