@@ -24,7 +24,7 @@ import anthropic
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from functools import partial
 import json
@@ -858,6 +858,39 @@ GEMINI_CACHE_TTL_SECONDS = int(GEMINI_CACHE_TTL_HOURS * 3600)  # cache auto-expi
 GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR = 1.0
 
 
+def _utcnow() -> datetime:
+    """Timezone-AWARE current UTC. ALL Gemini cache expiry/storage math uses this
+    one clock. Mixing datetime.now() (naive LOCAL) with Gemini's UTC expireTime
+    was the bug that made a US-Eastern box believe a cache was still alive ~4h
+    after Google had already deleted it — a dead zone of full-price re-uploads."""
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Coerce a datetime to aware UTC. A naive value is ASSUMED UTC (what we now
+    persist). Guards against 'can't compare offset-naive and offset-aware' when
+    older persisted entries (historically a naive-UTC / naive-local mix) are
+    compared against _utcnow()."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _gemini_storage_cost(
+    tokens: int, created: datetime, expires: Optional[datetime], now: datetime
+) -> float:
+    """Storage $ one Gemini context cache accrued from creation → min(now, expiry).
+    Storage bills per token-hour for as long as the cache lives, so billing stops
+    at the cache's expiry, not at whenever we notice/tear it down."""
+    created = _as_utc(created)
+    end = now
+    expires = _as_utc(expires)
+    if expires is not None and expires < end:
+        end = expires
+    hours = max(0.0, (end - created).total_seconds() / 3600.0)
+    return tokens / 1_000_000 * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR * hours
+
+
 # =============================================================================
 # PROVIDER REGISTRY (Phase 0 — config-driven provider wiring)
 # =============================================================================
@@ -1463,6 +1496,10 @@ class ReadingMaterial:
     # cache_control on the system block, which doesn't need a stored handle.
     cache_handles: dict[str, str] = field(default_factory=dict)
     cache_expires_at: dict[str, datetime] = field(default_factory=dict)
+    # When each cache handle was created (aware UTC), keyed like cache_handles.
+    # Drives real-lifetime storage metering in !cost instead of a creation-time
+    # one-TTL guess. See _gemini_storage_cost / _settle_gemini_storage.
+    cache_created_at: dict[str, datetime] = field(default_factory=dict)
     # Bookclub recaps: per-chapter "previously on" summaries (1-indexed chapter
     # number → text), generated once by a cheap model and cached here. Injected
     # into scoped threads so a context-limited model that only sees a LATER
@@ -1491,6 +1528,9 @@ class ReadingMaterial:
             "cache_expires_at": {
                 k: v.isoformat() for k, v in self.cache_expires_at.items()
             },
+            "cache_created_at": {
+                k: v.isoformat() for k, v in self.cache_created_at.items()
+            },
             "chapter_recaps": {str(k): v for k, v in self.chapter_recaps.items()},
             "recap_text": self.recap_text,
         }
@@ -1507,8 +1547,12 @@ class ReadingMaterial:
             ),
             cache_handles=dict(data.get("cache_handles", {})),
             cache_expires_at={
-                k: datetime.fromisoformat(v)
+                k: _as_utc(datetime.fromisoformat(v))
                 for k, v in data.get("cache_expires_at", {}).items()
+            },
+            cache_created_at={
+                k: _as_utc(datetime.fromisoformat(v))
+                for k, v in data.get("cache_created_at", {}).items()
             },
             chapter_recaps={
                 int(k): v for k, v in data.get("chapter_recaps", {}).items()
@@ -1764,8 +1808,25 @@ class ConversationManager:
         co2_g_total = 0.0
         train_co2_g_total = 0.0
 
+        # Live (in-flight) Gemini cache storage. total_cache_storage_cost_est
+        # holds only SETTLED storage from caches already torn down; add what
+        # currently-alive caches have accrued so far (created_at → now, capped at
+        # expiry) so the figure tracks the real, growing bill instead of the
+        # stale creation-time guess that used to read cheap while the balance bled.
+        now = _utcnow()
+        gemini_live_storage = 0.0
+        for mat in self.reading_materials.values():
+            for k, created in mat.cache_created_at.items():
+                if k.startswith("Gemini"):
+                    gemini_live_storage += _gemini_storage_cost(
+                        mat.estimated_tokens, created,
+                        mat.cache_expires_at.get(k), now,
+                    )
+
         for p in providers:
             storage_est = p.total_cache_storage_cost_est
+            if p.name == "Gemini":
+                storage_est += gemini_live_storage
             if p.total_requests == 0 and storage_est == 0.0:
                 continue
             cost = p.get_cost()
@@ -1800,9 +1861,13 @@ class ConversationManager:
                 f"{cost_str}"
             )
             if storage_est > 0:
+                live_note = (
+                    f", ${gemini_live_storage:.4f} still accruing on a live cache"
+                    if p.name == "Gemini" and gemini_live_storage > 0 else ""
+                )
                 lines.append(
-                    f"      ⏳ + ~${storage_est:.4f} est. Gemini cache storage "
-                    f"(time-based, separate from tokens)"
+                    f"      ⏳ + ~${storage_est:.4f} Gemini cache storage "
+                    f"(time-based, per token-hour{live_note})"
                 )
             if energy_wh > 0:
                 grid = p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None else GRID_GCO2_PER_KWH
@@ -1966,6 +2031,28 @@ class IsaicBot:
         self.qwen_provider = self.registry.by_id("qwen")
         self.glm_provider = self.registry.by_id("glm")
         self.sim_provider = self.registry.by_id("sim")   # Phase 7 simulator (Dummy Plug)
+
+        # Bookclub Gemini caching mode. Default: INLINE (False). A loaded book is
+        # inlined into Gemini's context each turn and Google's IMPLICIT caching
+        # supplies the read discount with NO per-hour storage bill — no
+        # cachedContents to create, refresh, leak, or !uncache (the whole class of
+        # cost bugs this replaced). Flip to EXPLICIT via config
+        # (providers.gemini.explicit_cache: true) or the admin !explicitcache
+        # command: an explicit cachedContents cache gives a *guaranteed* read
+        # discount, worth it ONLY for a sustained back-to-back marathon — it bills
+        # ~$0.45/hr storage for a 452k book the whole time it's alive (metered live
+        # in !cost), so turn it back off (→ inline, drops the cache) when done.
+        _pcfg = self._raw_config.get("providers", {})
+        _gcfg = _pcfg.get("gemini", {}) if isinstance(_pcfg, dict) else {}
+        self.gemini_explicit_cache = bool(
+            _gcfg.get("explicit_cache", False) if isinstance(_gcfg, dict) else False
+        )
+        print(
+            "🟡 Gemini bookclub: EXPLICIT cache mode ON (per-hour storage billing — "
+            "marathon mode; !explicitcache off to return to inline)"
+            if self.gemini_explicit_cache
+            else "🟢 Gemini bookclub: INLINE mode (implicit caching, no storage bill)"
+        )
 
         # Clients. `clients` is keyed by provider id; `claude_client` /
         # `gemini_client` stay as named handles because their native SDK paths
@@ -3397,33 +3484,37 @@ class IsaicBot:
         if not cache_name:
             return None
         try:
-            # ISO 8601 with Z suffix → fromisoformat needs +00:00
-            expires_at = datetime.fromisoformat(expire_time_str.replace("Z", "+00:00"))
-            # Strip tz for naive comparisons with our datetime.now() elsewhere
-            expires_at = expires_at.replace(tzinfo=None)
+            # ISO 8601 with Z suffix → fromisoformat needs +00:00. Keep it
+            # timezone-AWARE (UTC): every expiry comparison uses _utcnow() (aware
+            # UTC), so this must be aware too — do NOT strip tzinfo.
+            expires_at = _as_utc(
+                datetime.fromisoformat(expire_time_str.replace("Z", "+00:00"))
+            )
         except (ValueError, AttributeError):
-            expires_at = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+            expires_at = _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
 
-        # Record the creation cost. Cache creation bills the cached tokens at
-        # ~the input rate (one-time); this used to be completely untracked,
-        # which is how bookclub caching ran up a silent ~$156 bill. Storage is
-        # billed separately per token-hour over the TTL — we can't meter that
-        # from here, so log a heads-up estimate (deletion on !unload bounds it).
+        # Record the one-time CREATION token cost (cached tokens billed ~at the
+        # input rate). This was once untracked — a silent ~$156 bill. Kept.
         cached_tokens = int((data.get("usageMetadata") or {}).get("totalTokenCount", 0)) \
             or material.estimated_tokens
         self.gemini_provider.record_usage(cached_tokens, 0)
         self.gemini_provider.total_requests += 1
-        storage_est = (
+        # STORAGE (per token-hour) is NOT pre-charged here anymore. It used to add
+        # one full TTL's worth at creation, so a cache the sliding window kept
+        # alive for days still showed one TTL — !cost read cheap while the balance
+        # bled. It now accrues against the cache's REAL lifetime: live caches are
+        # metered on the fly in get_cost_summary and the elapsed cost is settled
+        # into total_cache_storage_cost_est at teardown (_settle_gemini_storage).
+        storage_per_ttl = (
             (cached_tokens / 1_000_000)
             * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR
             * (GEMINI_CACHE_TTL_SECONDS / 3600)
         )
-        self.gemini_provider.total_cache_storage_cost_est += storage_est
         print(
             f"🟢 Created Gemini cache {cache_name} "
-            f"({cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M}); "
-            f"~${storage_est:.2f} storage if kept its full "
-            f"{GEMINI_CACHE_TTL_HOURS:g}h TTL — deleted on !unload"
+            f"({cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M} UTC); "
+            f"storage ≈ ${storage_per_ttl:.2f} per {GEMINI_CACHE_TTL_HOURS:g}h alive "
+            f"(metered live in !cost) — deleted on !unload/!uncache"
         )
         return cache_name, expires_at
 
@@ -3460,16 +3551,16 @@ class IsaicBot:
                 existing = material.cache_handles[key] = legacy
                 if legacy_exp is not None:
                     expires = material.cache_expires_at[key] = legacy_exp
-        if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+        if existing and expires and _as_utc(expires) > _utcnow() + timedelta(minutes=5):
             # Sliding-window TTL: once the cache is past the halfway point of its
             # life, bump it back to a full TTL so an ACTIVE discussion never hits
             # a mid-conversation expiry (refreshing only past halfway avoids a
             # PATCH on every message). An IDLE cache still dies ~TTL after its
             # last use. Best-effort — on failure the cache still works to expiry.
-            halfway = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
-            if expires < halfway and await self._refresh_gemini_cache(existing):
+            halfway = _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
+            if _as_utc(expires) < halfway and await self._refresh_gemini_cache(existing):
                 material.cache_expires_at[key] = (
-                    datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+                    _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
                 )
                 self.manager.mark_dirty()
             return existing
@@ -3478,6 +3569,9 @@ class IsaicBot:
         if existing:
             await self._delete_gemini_cache(existing)
 
+        # Settle the replaced cache's REAL storage cost before we overwrite its
+        # created_at below, so a churned cache's spend isn't silently dropped.
+        self._settle_gemini_storage(material, key)
         result = await self._create_gemini_cache(
             material, system_text=system_text, tools=tools
         )
@@ -3486,6 +3580,7 @@ class IsaicBot:
         cache_name, expires_at = result
         material.cache_handles[key] = cache_name
         material.cache_expires_at[key] = expires_at
+        material.cache_created_at[key] = _utcnow()
         self.manager.mark_dirty()  # persist the new cache handle
         return cache_name
 
@@ -3520,11 +3615,14 @@ class IsaicBot:
     async def _delete_gemini_cache(self, cache_name: Optional[str]) -> bool:
         """Delete a Gemini cachedContents entry to stop its storage billing.
 
-        Best-effort. An already-expired/deleted cache counts as success — Gemini
-        returns 404 OR a 403 PERMISSION_DENIED ("CachedContent not found (or
-        permission denied)") for a gone cache (it 403s rather than 404s to avoid
-        leaking existence), so both mean "already gone". Gemini bills storage per
-        token-hour for the whole TTL, so deleting promptly keeps bookclub cheap."""
+        Returns True ONLY when the cache is actually gone: HTTP 200/204, a 404,
+        or a 403 whose body says "not found" (Gemini 403s rather than 404s for a
+        gone cache to avoid leaking existence, with a "…not found (or permission
+        denied)" message). A *bare* 403 — no "not found" in the body — means the
+        delete was DENIED while the cache is still alive and still billing
+        (balance depleted / permission / quota); that is a real FAILURE and
+        returns False, so callers don't falsely report "billing stopped" or drop
+        the handle on a still-accruing cache (the bug behind !uncache lying)."""
         if not cache_name:
             return False
         gemini_key = os.getenv("GEMINI_API_KEY")
@@ -3538,37 +3636,75 @@ class IsaicBot:
                     if resp.status in (200, 204):
                         print(f"🗑️  Deleted Gemini cache {cache_name} (HTTP {resp.status})")
                         return True
-                    if resp.status in (403, 404):
-                        # Already expired/deleted — Gemini 403s (not 404s) for a
-                        # gone cache. That's the desired end state, so: success.
+                    body = (await resp.text())[:300]
+                    if resp.status == 404 or (
+                        resp.status == 403 and "not found" in body.lower()
+                    ):
+                        # Genuinely gone — the desired end state, so: success.
                         print(f"🗑️  Gemini cache {cache_name} already gone (HTTP {resp.status})")
                         return True
-                    print(f"⚠️  Gemini cache delete {cache_name}: HTTP {resp.status}: "
-                          f"{(await resp.text())[:200]}")
+                    # Bare 403 / 429 / 5xx: the cache is (or may still be) ALIVE
+                    # and billing. Do NOT claim success.
+                    print(f"⚠️  Gemini cache delete {cache_name} FAILED — cache may still "
+                          f"be billing: HTTP {resp.status}: {body}")
                     return False
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             print(f"⚠️  Gemini cache delete network error: {e}")
             return False
 
-    async def _drop_gemini_cache(self, material: "ReadingMaterial") -> None:
+    def _settle_gemini_storage(self, material: "ReadingMaterial", key: str) -> None:
+        """Fold a Gemini cache's accrued STORAGE cost into the settled running
+        total (total_cache_storage_cost_est) and forget its created_at. Called
+        when a cache leaves live tracking (deleted, replaced, abandoned) so !cost
+        reflects the cache's REAL lifetime, not a creation-time one-TTL guess.
+        Idempotent — a no-op when the key has no tracked creation."""
+        created = material.cache_created_at.pop(key, None)
+        if created is None:
+            return
+        self.gemini_provider.total_cache_storage_cost_est += _gemini_storage_cost(
+            material.estimated_tokens,
+            created,
+            material.cache_expires_at.get(key),
+            _utcnow(),
+        )
+
+    async def _drop_gemini_cache(self, material: "ReadingMaterial") -> tuple[int, int]:
         """Delete a material's live Gemini cache(s) and clear the handle(s).
         Handles any backend-tagged key ("Gemini:developer_api" / "Gemini:vertex")
         plus the legacy untagged "Gemini", deleting each via the matching
-        backend's API."""
+        backend's API.
+
+        The delete is attempted BEFORE the handle is cleared, and the handle is
+        KEPT if the delete fails (e.g. a billing/permission 403 on a still-alive
+        cache) so it isn't orphaned beyond our reach. Returns (attempted, deleted)
+        so callers can report the truth instead of an unconditional success."""
         keys = [k for k in list(material.cache_handles) if k.startswith("Gemini")]
-        dropped = False
+        attempted = 0
+        deleted = 0
+        changed = False
         for k in keys:
-            cache_name = material.cache_handles.pop(k, None)
-            material.cache_expires_at.pop(k, None)
+            cache_name = material.cache_handles.get(k)
             if not cache_name:
+                material.cache_handles.pop(k, None)
+                material.cache_expires_at.pop(k, None)
+                material.cache_created_at.pop(k, None)
                 continue
-            dropped = True
+            attempted += 1
             if k.endswith(":vertex"):
-                await self._delete_gemini_vertex_cache(cache_name)
+                ok = await self._delete_gemini_vertex_cache(cache_name)
             else:
-                await self._delete_gemini_cache(cache_name)
-        if dropped:
+                ok = await self._delete_gemini_cache(cache_name)
+            if ok:
+                deleted += 1
+                # Settle real storage BEFORE clearing expiry (settle reads it).
+                self._settle_gemini_storage(material, k)
+                material.cache_handles.pop(k, None)
+                material.cache_expires_at.pop(k, None)
+                changed = True
+            # else: keep the handle — the cache may still be live and billing.
+        if changed:
             self.manager.mark_dirty()
+        return attempted, deleted
 
     async def _delete_gemini_vertex_cache(self, cache_name: Optional[str]) -> bool:
         """Delete a Vertex CachedContent (stops its storage billing).
@@ -3628,18 +3764,14 @@ class IsaicBot:
         except Exception as e:
             print(f"⚠️  Vertex cache creation failed: {e}")
             return None
-        expires_at = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+        expires_at = _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
         cached_tokens = material.estimated_tokens
         self.gemini_provider.record_usage(cached_tokens, 0)
         self.gemini_provider.total_requests += 1
-        storage_est = (
-            (cached_tokens / 1_000_000)
-            * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR
-            * (GEMINI_CACHE_TTL_SECONDS / 3600)
-        )
-        self.gemini_provider.total_cache_storage_cost_est += storage_est
+        # Storage accrues by real lifetime (see _create_gemini_cache), metered
+        # live in !cost and settled at teardown — not pre-charged here.
         print(f"🟢 Created Vertex cache {cache.name} "
-              f"(~{cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M})")
+              f"(~{cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M} UTC)")
         return cache.name, expires_at
 
     async def _ensure_gemini_vertex_cache(
@@ -3650,17 +3782,18 @@ class IsaicBot:
         key = self._gemini_cache_key()
         existing = material.cache_handles.get(key)
         expires = material.cache_expires_at.get(key)
-        if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+        if existing and expires and _as_utc(expires) > _utcnow() + timedelta(minutes=5):
             # Sliding-window TTL (see _ensure_gemini_cache). Best-effort.
-            halfway = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
-            if expires < halfway and await self._refresh_gemini_vertex_cache(existing):
+            halfway = _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
+            if _as_utc(expires) < halfway and await self._refresh_gemini_vertex_cache(existing):
                 material.cache_expires_at[key] = (
-                    datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+                    _utcnow() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
                 )
                 self.manager.mark_dirty()
             return existing
         if existing:
             await self._delete_gemini_vertex_cache(existing)
+        self._settle_gemini_storage(material, key)
         result = await asyncio.to_thread(
             self._create_gemini_vertex_cache, material, system_text
         )
@@ -3669,6 +3802,7 @@ class IsaicBot:
         cache_name, expires_at = result
         material.cache_handles[key] = cache_name
         material.cache_expires_at[key] = expires_at
+        material.cache_created_at[key] = _utcnow()
         self.manager.mark_dirty()
         return cache_name
 
@@ -4205,7 +4339,35 @@ class IsaicBot:
                     cached_input_tokens=cached_hit,
                 )
 
-            response_text = response.choices[0].message.content or ""
+            msg0 = response.choices[0]
+            response_text = msg0.message.content or ""
+            # Empty content is a real failure mode — a transient blank completion,
+            # a China-API content filter, or a tool-call the 3-round cap cut off.
+            # It used to surface as a silent '' → a dropped panel member with no
+            # second chance (why a first !research could lose DeepSeek while the
+            # next one worked). Log WHY, then retry once.
+            if not response_text.strip():
+                fin = getattr(msg0, "finish_reason", "?")
+                had_tc = bool(getattr(msg0.message, "tool_calls", None))
+                print(f"⚠️  {provider.name} returned empty content "
+                      f"(finish_reason={fin}, pending_tool_calls={had_tc}) — retrying once")
+                retry_kwargs = dict(api_kwargs)
+                if had_tc and "tools" in retry_kwargs:
+                    # Loop cap hit mid-search — force a text answer this round.
+                    retry_kwargs["tool_choice"] = "none"
+                try:
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create, **retry_kwargs,
+                    )
+                    cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+                    provider.record_usage(
+                        max(0, response.usage.prompt_tokens - cached_hit),
+                        response.usage.completion_tokens,
+                        cached_input_tokens=cached_hit,
+                    )
+                    response_text = response.choices[0].message.content or ""
+                except Exception as e:
+                    print(f"⚠️  {provider.name} empty-retry failed: {e}")
             reasoning = (
                 getattr(response.choices[0].message, "reasoning_content", None) or ""
             ) if (thinking and provider.requires_reasoning_echo) else ""
@@ -4575,8 +4737,11 @@ class IsaicBot:
         # fic as a system block (Gemini's cache treats systemInstruction +
         # contents together as the cached prefix).
         cache_system_text = system
+        # Explicit cachedContents only in marathon mode (self.gemini_explicit_cache).
+        # Default (inline): cache_name stays None → the fic is inlined below and
+        # Google's implicit caching supplies the read discount, with no storage bill.
         cache_name: Optional[str] = None
-        if reading_material is not None:
+        if reading_material is not None and self.gemini_explicit_cache:
             cache_name = await self._ensure_gemini_cache(
                 reading_material,
                 system_text=cache_system_text,
@@ -4763,10 +4928,10 @@ class IsaicBot:
             return ("Gemini Vertex Error: GOOGLE_CLOUD_PROJECT not set "
                     "(project + ADC required for the vertex backend).", [], "")
 
-        # Bake the fic into a Vertex cache (system + search + work) when a reading
-        # material is loaded; otherwise inline system + search on the call.
+        # Bake the fic into a Vertex cache only in marathon mode; otherwise inline
+        # system + search on the call (implicit caching, no storage bill).
         cache_name: Optional[str] = None
-        if reading_material is not None:
+        if reading_material is not None and self.gemini_explicit_cache:
             cache_name = await self._ensure_gemini_vertex_cache(
                 reading_material, system_text=system
             )
@@ -5191,16 +5356,20 @@ class IsaicBot:
         system: str,
         *,
         claude_tools: Optional[list] = None,
+        thinking: bool = False,
     ) -> str:
         """Run one model (panel member or judge) on a shared prompt; return its text.
 
         Reuses the normal per-provider generation paths so usage/cost tracking and
         each provider's own web search come along for free. claude_tools is
-        forwarded only on the Claude path — pass [] to disable Claude's web search
-        (used for the judge so it synthesises rather than re-researches)."""
+        forwarded only on the Claude path; the default (None) keeps Claude's
+        web_search on. Both members AND the judge keep search so the judge can
+        VERIFY post-cutoff / contested claims rather than dismissing them from
+        stale priors. thinking is forwarded on the Claude path (used for the
+        judge — adjudicating + deciding what to verify wants real reasoning)."""
         if provider is self.claude_provider:
             text, _, _ = await self._generate_claude_response(
-                guild_id, messages, system, tools=claude_tools,
+                guild_id, messages, system, tools=claude_tools, thinking=thinking,
             )
             return text
         client = self.openai_compatible_clients.get(provider.name)
@@ -5263,24 +5432,46 @@ class IsaicBot:
         panel_block = "\n\n".join(
             f"### Answer from {p.name}\n{text}" for p, text in answers
         )
+        today = datetime.now().strftime("%Y-%m-%d")
         judge_system = (
-            "You are the judge of a panel of AI models that independently answered a "
-            "research question. You are given the question and each model's answer. Do NOT "
-            "simply concatenate or average them. Compare them critically: where they agree, "
-            "treat the claim as higher-confidence; where they conflict, resolve it and say "
-            "why; flag claims that look unsupported. Produce ONE authoritative, well-structured "
-            "answer that is better than any single input. Attribute a contested or non-obvious "
-            "claim to the model(s) it came from only when that helps the reader judge "
-            "reliability. Don't mention being a judge or narrate your process — just give the "
-            "answer."
+            f"You are the judge of a panel of AI models that independently answered a "
+            f"research question. You are given the question and each model's answer. Today's "
+            f"date is {today}.\n\n"
+            "Produce ONE authoritative, well-structured answer that is better than any single "
+            "input — do NOT just concatenate or average them. Compare them critically: where "
+            "they agree, treat a claim as higher-confidence; where they conflict, resolve it "
+            "and say why.\n\n"
+            "EPISTEMICS — read carefully:\n"
+            "• Your training data has a fixed cutoff and may be many months behind today's "
+            "date. A model, product, price, version, company, or event you don't recognize "
+            "may be REAL and RECENT, not fabricated. Absence from your memory is NOT evidence "
+            "that something is fake.\n"
+            "• You have a web_search tool. When a load-bearing claim is one you cannot confirm "
+            "from your own knowledge — ESPECIALLY specific named products/versions, prices, "
+            "dates, capabilities, or events that could postdate your cutoff — SEARCH to verify "
+            "it before ruling. Verify the decision-critical claims; you needn't re-research "
+            "everything the panel already covered well.\n"
+            "• Use calibrated verdicts: CONFIRMED (search backs it), CONTRADICTED (search "
+            "refutes it — say so), or UNVERIFIED (you couldn't confirm it — say exactly that). "
+            "NEVER call a claim 'fabricated', 'fake', or 'vapor' merely because it isn't in "
+            "your training data or you didn't immediately find it — reserve that for claims "
+            "search ACTIVELY contradicts. When the panel members disagree on a fact, or one "
+            "cites sources you can't confirm, search to settle it rather than siding with your "
+            "prior.\n\n"
+            "Attribute a contested or non-obvious claim to the model(s) it came from only when "
+            "that helps the reader judge reliability. Don't narrate that you're a judge — just "
+            "give the answer (you may briefly note which key facts you verified by search)."
         )
         judge_messages = [{
             "role": "user",
             "content": f"Research question:\n{query}\n\nPanel answers:\n\n{panel_block}",
         }]
-        # Disable Claude's web search for judging — synthesise from answers given.
+        # The judge KEEPS web search (default tools) so it can VERIFY decision-critical
+        # or post-cutoff claims before ruling — judging blind over stale priors is how it
+        # once dismissed real post-cutoff products as "vapor". thinking=True: adjudicating
+        # conflicts + deciding what to verify is real reasoning, not a formatting pass.
         return await self._panel_complete(
-            judge, guild_id, judge_messages, judge_system, claude_tools=[],
+            judge, guild_id, judge_messages, judge_system, thinking=True,
         )
 
     async def _web_search(
@@ -6354,7 +6545,16 @@ class IsaicBot:
             member_system = (
                 "You are one member of a panel of AI models answering a research question for "
                 "a technical user. Give your best, most accurate, well-structured answer. Be "
-                "concrete, show your reasoning, and cite sources with URLs when you use the web. "
+                "concrete and show your reasoning.\n"
+                "Sourcing rules (important — a later model fact-checks you):\n"
+                "• Your training data has a cutoff and may be behind today's date. If the "
+                "question names specific products, models, versions, prices, or events you "
+                "don't recognize, use the web_search tool to check whether they're REAL and "
+                "RECENT before answering — do NOT assume they're fabricated.\n"
+                "• Only cite a URL, article title, quote, date, or hash that came from an "
+                "actual web_search result in THIS conversation. NEVER invent, guess, or "
+                "reconstruct a citation from memory. If you did not search, attach no "
+                "citations — say plainly that the claim is from memory and may be out of date.\n"
                 "Another model will synthesise the panel's answers afterward, so optimise for "
                 "correctness and completeness, and don't address the other panelists."
             )
@@ -6858,8 +7058,12 @@ class IsaicBot:
                     "(A cache only exists once Gemini has actually been used in this channel.)"
                 )
             else:
+                total_attempted = 0
+                total_deleted = 0
                 for m in targets:
-                    await self._drop_gemini_cache(m)
+                    att, dele = await self._drop_gemini_cache(m)
+                    total_attempted += att
+                    total_deleted += dele
                 self.manager.mark_dirty()
                 await self.manager.save_memories_async(providers=self.providers)
                 title = f"**{material.title}**" if material is not None else "the scoped threads"
@@ -6867,10 +7071,69 @@ class IsaicBot:
                     f" (+{len(scoped)} scoped-thread cache{'s' if len(scoped) != 1 else ''})"
                     if scoped else ""
                 )
+                failed = total_attempted - total_deleted
+                if failed > 0:
+                    # A delete that didn't confirm gone (billing/permission 403,
+                    # 429, network). The cache may STILL be billing — say so
+                    # honestly instead of the old unconditional "billing stops now".
+                    await message.channel.send(
+                        f"⚠️ Couldn't confirm the Gemini cache for {title}{scoped_note} "
+                        f"is gone: {total_deleted}/{total_attempted} deleted, {failed} "
+                        f"unverified (likely a depleted balance, rate-limit, or network "
+                        f"error) — those may still be billing storage until they "
+                        f"self-expire at their {GEMINI_CACHE_TTL_HOURS:g}h TTL. I kept "
+                        f"their handles, so re-run `!uncache` once billing is live."
+                    )
+                else:
+                    await message.channel.send(
+                        f"🗑️ Dropped the Gemini cache for {title}{scoped_note} — "
+                        f"{total_deleted} cache(s) confirmed deleted, storage billing "
+                        f"stops now. The book's still loaded for all models. You're in "
+                        f"explicit-cache mode, so Gemini rebuilds a fresh "
+                        f"{GEMINI_CACHE_TTL_HOURS:g}h cache on its next turn here — "
+                        f"`!explicitcache off` switches to inline (no cache) to keep it off."
+                    )
+
+        elif cmd == "!explicitcache":
+            # Toggle Gemini bookclub caching: INLINE (default — implicit caching,
+            # no storage bill, nothing to leak) vs EXPLICIT (cachedContents —
+            # guaranteed read discount but bills ~$0.45/hr storage for a 452k
+            # book; worth it ONLY for a sustained back-to-back marathon). In-memory
+            # (resets to inline on restart — the fail-safe default given the cost
+            # history); set providers.gemini.explicit_cache in config for a sticky
+            # startup default.
+            arg = parts[1].lower() if len(parts) >= 2 else ""
+            if arg in ("on", "explicit", "true", "1", "enable"):
+                self.gemini_explicit_cache = True
                 await message.channel.send(
-                    f"🗑️ Dropped the Gemini cache for {title}{scoped_note} — storage "
-                    f"billing stops now. The book's still loaded for all models; Gemini "
-                    f"recreates a fresh {GEMINI_CACHE_TTL_HOURS:g}h cache on its next turn."
+                    "🟡 Gemini bookclub cache → **EXPLICIT** (cachedContents). Guaranteed "
+                    "read discount for a back-to-back **marathon** — but it bills ~$0.45/hr "
+                    "storage for a 452k book the whole time it stays alive. `!cost` meters "
+                    "that live; run `!explicitcache off` (or `!unload`) when you're done. "
+                    "(In-memory — resets to inline on restart.)"
+                )
+            elif arg in ("off", "inline", "false", "0", "disable"):
+                self.gemini_explicit_cache = False
+                dropped = 0
+                for m in list(self.manager.reading_materials.values()):
+                    _, d = await self._drop_gemini_cache(m)
+                    dropped += d
+                if dropped:
+                    self.manager.mark_dirty()
+                    await self.manager.save_memories_async(providers=self.providers)
+                note = f" Dropped {dropped} live cache(s); storage billing stops now." if dropped else ""
+                await message.channel.send(
+                    f"🟢 Gemini bookclub cache → **INLINE** (implicit caching, no storage "
+                    f"bill — the cheap default, nothing to leak).{note}"
+                )
+            else:
+                state = ("**EXPLICIT** (cachedContents — marathon mode, bills ~$0.45/hr storage)"
+                         if self.gemini_explicit_cache
+                         else "**INLINE** (implicit caching, no storage bill — default)")
+                await message.channel.send(
+                    f"Gemini bookclub cache mode: {state}.\n"
+                    f"• `!explicitcache on` — explicit cache (only for a sustained marathon)\n"
+                    f"• `!explicitcache off` — inline (default; also drops any live cache)"
                 )
 
         elif cmd == "!reading":
