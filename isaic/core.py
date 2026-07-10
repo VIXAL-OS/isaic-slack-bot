@@ -2951,6 +2951,70 @@ class IsaicBot:
         }
     }]
 
+    # DeepSeek's chat template wraps tool calls in these special tokens. The
+    # separator is U+2581 (LOWER ONE EIGHTH BLOCK), not an ASCII underscore —
+    # match both, since some deployments normalize it.
+    _TOOL_TOKEN_RE = re.compile(r"<\|tool[▁_][^|>]{0,32}\|>")
+
+    @staticmethod
+    def _tool_call_extra_content(tool_call) -> Optional[dict]:
+        """Return a tool_call's provider-specific `extra_content`, if any.
+
+        Gemini 3 thinking models attach an encrypted `thought_signature` to every
+        function call and reject the FOLLOW-UP request with HTTP 400 ("Function
+        call is missing a thought_signature") unless it is echoed back verbatim on
+        the assistant turn. Over the OpenAI shim it arrives as
+        tool_calls[i].extra_content.google.thought_signature — an unknown field, so
+        the SDK parks it in model_extra rather than exposing a typed attribute.
+        Read it defensively: attribute first, then model_dump().
+
+        Lowering thinking_level / reasoning_effort does NOT lift the requirement —
+        signatures are emitted even at minimal reasoning, and Gemini 3 Pro cannot
+        turn thinking off. Echoing is the only fix short of dropping tools.
+        """
+        extra = getattr(tool_call, "extra_content", None)
+        if extra is None and hasattr(tool_call, "model_dump"):
+            extra = tool_call.model_dump().get("extra_content")
+        if hasattr(extra, "model_dump"):
+            extra = extra.model_dump()
+        return extra if isinstance(extra, dict) and extra else None
+
+    def _looks_like_tool_call_dump(self, text: str) -> bool:
+        """True if the model wrote a tool call into `content` instead of calling it.
+
+        DeepSeek V4-Pro does this intermittently — finish_reason="stop",
+        tool_calls=null, and the call serialized into the message body
+        (deepseek-ai/DeepSeek-V3#1244, ~2 of 19 completions, still open). The text
+        is non-empty, so without this guard it passes _is_provider_error, counts as
+        a surviving `!research` panelist, and reaches the judge as an "answer".
+
+        Deliberately high-precision: this bot answers questions ABOUT JSON and about
+        the web_search tool itself, so only fire on shapes prose never produces —
+        the chat template's own special tokens, a declared tool name welded straight
+        onto a JSON object, or a whole message that IS a bare tool-call object.
+        """
+        if not text:
+            return False
+        if self._TOOL_TOKEN_RE.search(text):
+            return True
+        for tool in self.OPENAI_COMPATIBLE_TOOLS:
+            name = re.escape(tool["function"]["name"])
+            # `web_search{"query": …}` / `functions.web_search {"query": …}`.
+            # Prose says "the web_search tool", never `web_search{"`.
+            if re.search(rf"(?:^|[^\w.]|\bfunctions\.){name}\s*\{{\s*\"", text):
+                return True
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                obj = json.loads(stripped)
+            except ValueError:
+                return False
+            if isinstance(obj, dict) and (
+                {"name", "arguments"} <= obj.keys() or "tool_call" in obj
+            ):
+                return True
+        return False
+
     async def _tavily_search(self, query: str, max_results: int = 5) -> SearchResult:
         """Perform a web search via Tavily. Returns raw hits (not synthesized).
 
@@ -4288,18 +4352,25 @@ class IsaicBot:
                 tool_rounds += 1
                 assistant_msg = response.choices[0].message
 
-                # Add assistant message with tool calls to conversation
+                # Add assistant message with tool calls to conversation.
+                # extra_content carries Gemini's per-call thought_signature — the
+                # follow-up request 400s without it. Echo back exactly what each
+                # call arrived with; never synthesize one for a call that had none.
+                rebuilt_calls: list[dict] = []
+                for tc in assistant_msg.tool_calls:
+                    call: dict = {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    extra = self._tool_call_extra_content(tc)
+                    if extra:
+                        call["extra_content"] = extra
+                    rebuilt_calls.append(call)
                 tool_assistant: dict = {
                     "role": "assistant",
                     "content": assistant_msg.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-                        }
-                        for tc in assistant_msg.tool_calls
-                    ]
+                    "tool_calls": rebuilt_calls,
                 }
                 if thinking and provider.requires_reasoning_echo:
                     tool_assistant["reasoning_content"] = (
@@ -4310,17 +4381,28 @@ class IsaicBot:
                 # Execute each tool call. Routed through _search_for so each
                 # provider uses its configured backend (Deepseek → Tavily,
                 # Gemini → native google_search grounding, etc.).
+                # Every tool_call id must be answered by exactly one tool message,
+                # or the follow-up request is malformed and the API 400s. An
+                # unrecognized tool name still gets an answer, not silence.
                 for tool_call in assistant_msg.tool_calls:
                     if tool_call.function.name == "web_search":
-                        import json as _json
-                        args = _json.loads(tool_call.function.arguments)
+                        try:
+                            args = json.loads(tool_call.function.arguments or "{}")
+                        except ValueError:
+                            args = {}
                         query = args.get("query", "")
                         search_result = await self._search_for(provider, query)
-                        openai_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": search_result.text,
-                        })
+                        content = search_result.text
+                    else:
+                        content = (
+                            f"Error: no tool named '{tool_call.function.name}' is "
+                            f"available. Answer from what you already have."
+                        )
+                    openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": content,
+                    })
 
                 # Continue conversation with tool results — refresh messages
                 # since api_kwargs holds a stripped copy.
@@ -4341,20 +4423,39 @@ class IsaicBot:
 
             msg0 = response.choices[0]
             response_text = msg0.message.content or ""
-            # Empty content is a real failure mode — a transient blank completion,
-            # a China-API content filter, or a tool-call the 3-round cap cut off.
-            # It used to surface as a silent '' → a dropped panel member with no
-            # second chance (why a first !research could lose DeepSeek while the
-            # next one worked). Log WHY, then retry once.
+
+            # Two degraded completions, both cured by one forced-text retry:
+            #  • empty content — a transient blank, a China-API content filter, or
+            #    a tool call the 3-round cap cut off. Used to surface as a silent
+            #    '' → a dropped panel member with no second chance.
+            #  • a tool call serialized into content instead of into tool_calls —
+            #    a live DeepSeek V4-Pro server bug (DeepSeek-V3#1244). Non-empty,
+            #    so it used to sail past _is_provider_error and reach the research
+            #    judge, which then had to editorialize that the "answer" was empty.
+            degraded = ""
             if not response_text.strip():
+                degraded = "empty content"
+            elif self._looks_like_tool_call_dump(response_text):
+                degraded = "tool call serialized into content"
+
+            if degraded:
                 fin = getattr(msg0, "finish_reason", "?")
                 had_tc = bool(getattr(msg0.message, "tool_calls", None))
-                print(f"⚠️  {provider.name} returned empty content "
+                print(f"⚠️  {provider.name} returned {degraded} "
                       f"(finish_reason={fin}, pending_tool_calls={had_tc}) — retrying once")
                 retry_kwargs = dict(api_kwargs)
-                if had_tc and "tools" in retry_kwargs:
-                    # Loop cap hit mid-search — force a text answer this round.
-                    retry_kwargs["tool_choice"] = "none"
+                if had_tc or degraded.startswith("tool call"):
+                    # The model has shown it wants to call a tool. DROP the schema
+                    # rather than setting tool_choice="none": a model that has
+                    # already decided to call a tool tends to verbalize the call
+                    # when merely forbidden from emitting it — which is the very
+                    # failure we're recovering from. Removing the affordance is
+                    # stronger, and saves the input tokens.
+                    #
+                    # A blank with no tool intent keeps its tools: that retry is
+                    # just a re-roll, and it may legitimately want to search.
+                    retry_kwargs.pop("tools", None)
+                    retry_kwargs.pop("tool_choice", None)
                 try:
                     response = await asyncio.to_thread(
                         client.chat.completions.create, **retry_kwargs,
@@ -4367,7 +4468,15 @@ class IsaicBot:
                     )
                     response_text = response.choices[0].message.content or ""
                 except Exception as e:
-                    print(f"⚠️  {provider.name} empty-retry failed: {e}")
+                    print(f"⚠️  {provider.name} degraded-retry failed: {e}")
+
+                # Still degraded → return a real error sentinel so the research
+                # panel DROPS this member instead of feeding the judge a tool call.
+                if not response_text.strip() or self._looks_like_tool_call_dump(response_text):
+                    return (
+                        f"{provider.name} Error: no usable answer "
+                        f"({degraded}; retry did not recover)", [], "",
+                    )
             reasoning = (
                 getattr(response.choices[0].message, "reasoning_content", None) or ""
             ) if (thinking and provider.requires_reasoning_echo) else ""
@@ -4394,6 +4503,14 @@ class IsaicBot:
             return response_text, reactions, reasoning
 
         except Exception as e:
+            if "thought_signature" in str(e):
+                # The echo in the tool loop above should prevent this. If it fires,
+                # the shim returned tool_calls WITHOUT extra_content, so there was
+                # nothing to echo — drop web_search for this provider (Gemini has
+                # native google_search grounding anyway) or route it native.
+                print(f"⚠️  {provider.name}: thought_signature round-trip failed — the "
+                      f"OpenAI shim returned no extra_content on its tool_calls. "
+                      f"Workaround: stop attaching web_search to this provider.")
             return f"{provider.name} Error: {e}", [], ""
 
     # =========================================================================
@@ -5376,7 +5493,7 @@ class IsaicBot:
         if client is None:
             raise RuntimeError(f"no OpenAI-compatible client for {provider.name}")
         text, _, _ = await self._generate_openai_compatible_response(
-            client, provider, guild_id, messages, system,
+            client, provider, guild_id, messages, system, thinking=thinking,
         )
         return text
 
@@ -5401,25 +5518,30 @@ class IsaicBot:
         messages: list[dict],
         system: str,
         members: list[ModelProvider],
-    ) -> list[tuple[ModelProvider, str]]:
+    ) -> tuple[list[tuple[ModelProvider, str]], list[tuple[str, str]]]:
         """Fan a shared prompt out to every panel member concurrently.
 
         Fault-tolerant: a member that raises, errors, or returns empty is dropped
-        (logged) rather than killing the panel. Returns [(provider, answer), ...]
-        for survivors, in the members' original order."""
+        (logged) rather than killing the panel. Returns (survivors, failures) —
+        survivors as [(provider, answer), ...] in the members' original order, and
+        failures as [(provider_name, reason), ...] so the caller can name them.
+        The reason is logged IN FULL: truncating it to 120 chars once hid a
+        systematic Gemini outage behind an unreadable stub."""
         async def run_one(provider: ModelProvider):
             try:
                 text = await self._panel_complete(provider, guild_id, list(messages), system)
             except Exception as e:
                 print(f"⚠️  Panel member {provider.name} raised: {e}")
-                return provider, None
+                return provider, None, f"{type(e).__name__}: {e}"
             if self._is_provider_error(provider, text):
-                print(f"⚠️  Panel member {provider.name} failed: {text[:120]!r}")
-                return provider, None
-            return provider, text.strip()
+                print(f"⚠️  Panel member {provider.name} failed: {text!r}")
+                return provider, None, text.strip() or "empty response"
+            return provider, text.strip(), None
 
         results = await asyncio.gather(*(run_one(p) for p in members))
-        return [(p, t) for p, t in results if t]
+        survivors = [(p, t) for p, t, _ in results if t]
+        failures = [(p.name, reason) for p, t, reason in results if not t]
+        return survivors, failures
 
     async def _judge(
         self,
@@ -6560,26 +6682,49 @@ class IsaicBot:
             )
 
             async with message.channel.typing():
-                answers = await self._run_panel(guild_id, history, member_system, members)
+                answers, failures = await self._run_panel(
+                    guild_id, history, member_system, members
+                )
                 if not answers:
-                    await message.channel.send(
-                        "❌ Every panel member failed to respond — check `!cost` / the logs."
-                    )
+                    fail_msg = "❌ Every panel member failed to respond — check `!cost` / the logs."
+                    detail = "\n".join(f"{n}: {r[:150]}" for n, r in failures)
+                    if detail:
+                        fail_msg += f"\n```\n{detail[:1500]}\n```"
+                    await message.channel.send(fail_msg)
                     return
-                verdict = await self._judge(guild_id, query, answers, judge)
+                try:
+                    verdict = await self._judge(guild_id, query, answers, judge)
+                except Exception as e:
+                    print(f"⚠️  Panel judge {judge.name} raised: {e}")
+                    verdict = f"{judge.name} Error: {e}"
 
-            if self.multi_model_active:
-                verdict = f"**[Panel → {judge.name}]** {verdict}"
-            await self._send_response(message.channel, verdict)
+            # The judge's own output was previously posted unguarded, so a
+            # transient "Claude Error 529: overloaded" got published as the
+            # panel's synthesis. Fall back to the raw answers instead — the
+            # panel already paid for them.
+            if self._is_provider_error(judge, verdict):
+                print(f"⚠️  Panel judge {judge.name} failed: {verdict!r}")
+                await message.channel.send(
+                    f"⚠️ The **{judge.name}** judge failed (`{verdict[:120]}`) — "
+                    f"posting the panel's raw answers instead."
+                )
+                for p, text in answers:
+                    await self._send_response(message.channel, f"**[{p.name}]** {text}")
+            else:
+                if self.multi_model_active:
+                    verdict = f"**[Panel → {judge.name}]** {verdict}"
+                await self._send_response(message.channel, verdict)
 
-            failed = len(members) - len(answers)
             note = (
                 f"🧪 Synthesised from {len(answers)} model(s) "
                 f"({', '.join(p.name for p, _ in answers)}) + {judge.name} judge"
             )
-            if failed:
-                note += f"; {failed} member(s) failed"
-            note += f". Costs ~{len(answers) + 1}× a normal reply — check `!cost`."
+            if failures:
+                # Name them. A bare "1 member(s) failed" hid a total Gemini outage.
+                note += f"; failed: {', '.join(n for n, _ in failures)}"
+            # Bill over members ATTEMPTED, not survivors — a member that failed
+            # after its first tool round still recorded usage.
+            note += f". Costs ~{len(members) + 1}× a normal reply — check `!cost`."
             await message.channel.send(f"*{note}*")
 
         elif cmd == "!speak":
