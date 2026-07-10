@@ -4481,13 +4481,8 @@ class IsaicBot:
                 getattr(response.choices[0].message, "reasoning_content", None) or ""
             ) if (thinking and provider.requires_reasoning_echo) else ""
 
-            # Process notes and reactions (same patterns as Claude)
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                self.manager.memories[guild_id].working.add(key, value)
-            response_text = re.sub(note_pattern, '', response_text)
+            # Working notes ([note: k: v]) -> memory, stripped from the reply.
+            response_text = self._extract_notes(response_text, guild_id)
 
             reactions = []
             reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -4794,12 +4789,7 @@ class IsaicBot:
 
             # Note / reaction parity with the chat heads (cheap; a base model
             # rarely emits these, but a persona preamble might steer one to).
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                self.manager.memories[guild_id].working.add(
-                    match.group(1).strip(), match.group(2).strip()
-                )
-            response_text = re.sub(note_pattern, '', response_text)
+            response_text = self._extract_notes(response_text, guild_id)
 
             reactions = []
             reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -4989,13 +4979,8 @@ class IsaicBot:
             # Light-touch logging so it's visible the cache is actually doing work.
             print(f"🟢 Gemini cache hit: {cached_tokens:,} cached tokens / {prompt_tokens:,} total")
 
-        # Process notes and reactions (same patterns as other generators)
-        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-        for match in re.finditer(note_pattern, response_text):
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-            self.manager.memories[guild_id].working.add(key, value)
-        response_text = re.sub(note_pattern, '', response_text)
+        # Working notes ([note: k: v]) -> memory, stripped from the reply.
+        response_text = self._extract_notes(response_text, guild_id)
 
         reactions: list[str] = []
         reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -5106,12 +5091,7 @@ class IsaicBot:
             self.gemini_provider.total_requests += 1
 
         # Process notes + reactions + formatting (same as the other generators).
-        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-        for match in re.finditer(note_pattern, response_text):
-            self.manager.memories[guild_id].working.add(
-                match.group(1).strip(), match.group(2).strip()
-            )
-        response_text = re.sub(note_pattern, '', response_text)
+        response_text = self._extract_notes(response_text, guild_id)
         reactions: list[str] = []
         for match in re.finditer(r'\[react:\s*([^\]]+)\]', response_text):
             reactions.append(match.group(1).strip())
@@ -5121,6 +5101,26 @@ class IsaicBot:
         response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)
         response_text = re.sub(r'  +', ' ', response_text)
         return response_text, reactions, ""
+
+    # One note-extraction path for EVERY generator (Claude, openai-compatible,
+    # Gemini native, Gemini Vertex, simulator) AND the two web-search paths AND
+    # the !summarize path, so a note tag can never leak into a visible message
+    # from one path that forgot to strip it. Case-insensitive: models emit
+    # [Note:] and [NOTE:] as readily as [note:].
+    _NOTE_RE = re.compile(r'\[note:\s*([^:\]]+):\s*([^\]]+)\]', re.IGNORECASE)
+
+    def _extract_notes(self, response_text: str, guild_id: int) -> str:
+        """Capture any [note: key: value] tags into this guild's working memory
+        and strip them from the visible text. Returns the cleaned text. Idempotent
+        (a second pass on already-clean text is a no-op), so it doubles as a
+        safety net on paths that may or may not have stripped already."""
+        if not response_text or "[note:" not in response_text.lower():
+            return response_text
+        for match in self._NOTE_RE.finditer(response_text):
+            self.manager.memories[guild_id].working.add(
+                match.group(1).strip(), match.group(2).strip()
+            )
+        return self._NOTE_RE.sub('', response_text)
 
     async def _generate_response(
         self,
@@ -5429,13 +5429,8 @@ class IsaicBot:
                 if hasattr(block, 'text'):
                     response_text += block.text
 
-            # Extract and process working memory notes
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                self.manager.memories[guild_id].working.add(key, value)
-            response_text = re.sub(note_pattern, '', response_text)
+            # Working notes ([note: k: v]) -> memory, stripped from the reply.
+            response_text = self._extract_notes(response_text, guild_id)
 
             # Extract reactions
             reactions = []
@@ -5713,9 +5708,11 @@ class IsaicBot:
                         inline=False
                     )
                 embeds.append(embed)
-            
-            return final_text.strip(), embeds
-            
+
+            # This path never touches a chat generator, so without this a [note:]
+            # tag tacked onto a !search answer leaks straight into the message.
+            return self._extract_notes(final_text, guild_id).strip(), embeds
+
         except anthropic.APIStatusError as e:
             if e.status_code >= 500:
                 req_id = getattr(e, "request_id", None) or "<not reported>"
@@ -6564,8 +6561,10 @@ class IsaicBot:
                     if search_result.is_grounded_answer:
                         # Gemini native: backend already synthesized the answer.
                         # Display directly; we don't need to round-trip through
-                        # the chat model again.
-                        response_text = search_result.text
+                        # the chat model again. Still run note extraction — this
+                        # path never touches a chat generator, so it would
+                        # otherwise leak any [note:] tag into the message.
+                        response_text = self._extract_notes(search_result.text, guild_id)
                     else:
                         # Tavily: feed raw hits through the chosen model for synthesis.
                         history = await self.manager.fetch_thread_history(message.channel)
@@ -6870,6 +6869,9 @@ class IsaicBot:
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
                         summary = summary_response.content[0].text.strip()
+                        # Safety net: strip any [note:] tag so it can't leak into
+                        # the saved summary or the confirmation message.
+                        summary = self._extract_notes(summary, guild_id).strip()
 
                         # Track usage (cache info goes through the helper too)
                         self._record_claude_usage(summary_response.usage)
