@@ -15,6 +15,7 @@ python-dotenv>=1.0.0
 matplotlib>=3.7.0          # LaTeX -> PNG rendering
 Pillow>=10.0.0             # compositing LaTeX PNGs
 beautifulsoup4>=4.12.0     # bookclub HTML parsing (AO3 + !load_text)
+pypdf>=4.0.0               # bookclub PDF parsing (!load_text .pdf); import-guarded — bot starts fine without it
 
 # --- OPTIONAL: Gemini `vertex` backend (data residency / IAM / SLA) ---
 # Lazy-imported; only needed if providers.gemini.backend == "vertex".

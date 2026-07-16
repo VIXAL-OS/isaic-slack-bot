@@ -47,6 +47,52 @@ except ImportError:
     _BeautifulSoup = None
     _HAS_BS4 = False
 
+# pypdf is an optional dep used only by !load_text for .pdf attachments.
+# Same graceful-degradation deal: without it, PDF loads return a pip-install
+# hint and everything else keeps working.
+try:
+    from pypdf import PdfReader as _PdfReader
+    _HAS_PYPDF = True
+except ImportError:
+    _PdfReader = None
+    _HAS_PYPDF = False
+
+
+def _extract_pdf_text(data: bytes) -> tuple[str, int]:
+    """Extract plain text from PDF bytes. Returns (text, page_count).
+
+    Raises ValueError with a user-facing message for password-protected PDFs
+    and for PDFs with no extractable text (scanned/image-only — those need
+    OCR, which is deliberately out of scope; convert to .txt upstream).
+    """
+    reader = _PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        decrypted = False
+        try:
+            # Many "encrypted" PDFs only set an owner password; an empty user
+            # password opens them (PasswordType.NOT_DECRYPTED is falsy).
+            decrypted = bool(reader.decrypt(""))
+        except Exception:
+            decrypted = False
+        if not decrypted:
+            raise ValueError(
+                "PDF is password-protected — decrypt it first (e.g. `qpdf --decrypt`) "
+                "or export to `.txt` and load that."
+            )
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")  # one unparseable page shouldn't sink the book
+    text = "\n\n".join(pages)
+    if not text.strip():
+        raise ValueError(
+            "PDF has no extractable text — likely a scanned/image-only PDF. "
+            "Run it through an OCR tool and load the resulting `.txt` instead."
+        )
+    return text, len(reader.pages)
+
 # matplotlib's mathtext is used to render LaTeX equations to PNG attachments
 # so Discord (which has no native math rendering) can show them properly.
 # Force the non-interactive Agg backend before any pyplot import so headless
@@ -1740,6 +1786,15 @@ class ConversationManager:
                 data = await resp.read()
                 return base64.b64encode(data).decode("utf-8")
     
+    async def _fetch_file_bytes(self, url: str) -> Optional[bytes]:
+        """Fetch raw bytes (binary formats — PDF; authenticated for Slack private URLs)."""
+        headers = self.platform.auth_headers() if self.platform and hasattr(self.platform, "auth_headers") else {}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.read()
+
     async def _fetch_text_file(self, url: str) -> Optional[str]:
         """Fetch a text file (authenticated for Slack private URLs)."""
         headers = self.platform.auth_headers() if self.platform and hasattr(self.platform, "auth_headers") else {}
@@ -6969,7 +7024,7 @@ class IsaicBot:
                         "  2. Set `AO3_COOKIE` in `.env` with your logged-in "
                         "`_otwarchive_session` cookie value, then `!load` again — "
                         "logged-in requests bypass shields-up.\n"
-                        "  3. Use `!load_text` with a `.txt` or `.html` attachment "
+                        "  3. Use `!load_text` with a `.txt`, `.html`, or `.pdf` attachment "
                         "if you have the work saved locally."
                     ),
                     "auth_required": (
@@ -7045,11 +7100,11 @@ class IsaicBot:
 
             attachments = [
                 a for a in message.attachments
-                if a.filename.lower().endswith((".txt", ".html", ".htm", ".md"))
+                if a.filename.lower().endswith((".txt", ".html", ".htm", ".md", ".pdf"))
             ]
             if not attachments:
                 await message.channel.send(
-                    "Usage: attach a `.txt`, `.html`, or `.md` file with `!load_text [title]` as the message.\n"
+                    "Usage: attach a `.txt`, `.html`, `.md`, or `.pdf` file with `!load_text [title]` as the message.\n"
                     "The file's contents will be pinned to this channel as reading material — "
                     "use this when AO3 is shields-up, the work is locked, or you have the text saved locally."
                 )
@@ -7063,35 +7118,64 @@ class IsaicBot:
                 )
                 return
 
-            await message.channel.send(f"📥 Reading {attachment.filename} …")
-            try:
-                raw = await self.manager._fetch_text_file(attachment.url)
-            except Exception as e:
-                await message.channel.send(f"❌ Couldn't read file: {e}")
-                return
-            if not raw:
-                await message.channel.send("❌ File came back empty.")
+            is_pdf = attachment.filename.lower().endswith(".pdf")
+            if is_pdf and not _HAS_PYPDF:
+                await message.channel.send(
+                    "❌ PDF files need `pypdf`. Install with `pip install pypdf`, "
+                    "or convert to `.txt` and try again."
+                )
                 return
 
-            # If it's HTML, strip tags. Otherwise treat as plain text.
-            is_html = attachment.filename.lower().endswith((".html", ".htm"))
-            if is_html:
-                if not _HAS_BS4:
-                    await message.channel.send(
-                        "❌ HTML files need `beautifulsoup4`. Install with `pip install beautifulsoup4`, "
-                        "or convert to `.txt` and try again."
-                    )
+            await message.channel.send(f"📥 Reading {attachment.filename} …")
+            pdf_page_count = 0
+            if is_pdf:
+                # PDFs are binary — fetch raw bytes, then extract in a worker
+                # thread (extraction is CPU-bound; seconds on a book-length file).
+                try:
+                    data = await self.manager._fetch_file_bytes(attachment.url)
+                except Exception as e:
+                    await message.channel.send(f"❌ Couldn't read file: {e}")
                     return
-                soup = _BeautifulSoup(raw, "html.parser")
-                # Strip scripts/styles
-                for tag in soup(["script", "style", "nav", "header", "footer"]):
-                    tag.decompose()
-                # AO3 download HTMLs have a #chapters wrapper; everything else
-                # just gets the body text.
-                container = soup.select_one("#chapters") or soup.body or soup
-                text = container.get_text("\n", strip=True)
+                if not data:
+                    await message.channel.send("❌ File came back empty.")
+                    return
+                try:
+                    text, pdf_page_count = await asyncio.to_thread(_extract_pdf_text, data)
+                except ValueError as e:
+                    await message.channel.send(f"❌ {e}")
+                    return
+                except Exception as e:
+                    await message.channel.send(f"❌ Couldn't parse PDF: {e}")
+                    return
             else:
-                text = raw
+                try:
+                    raw = await self.manager._fetch_text_file(attachment.url)
+                except Exception as e:
+                    await message.channel.send(f"❌ Couldn't read file: {e}")
+                    return
+                if not raw:
+                    await message.channel.send("❌ File came back empty.")
+                    return
+
+                # If it's HTML, strip tags. Otherwise treat as plain text.
+                is_html = attachment.filename.lower().endswith((".html", ".htm"))
+                if is_html:
+                    if not _HAS_BS4:
+                        await message.channel.send(
+                            "❌ HTML files need `beautifulsoup4`. Install with `pip install beautifulsoup4`, "
+                            "or convert to `.txt` and try again."
+                        )
+                        return
+                    soup = _BeautifulSoup(raw, "html.parser")
+                    # Strip scripts/styles
+                    for tag in soup(["script", "style", "nav", "header", "footer"]):
+                        tag.decompose()
+                    # AO3 download HTMLs have a #chapters wrapper; everything else
+                    # just gets the body text.
+                    container = soup.select_one("#chapters") or soup.body or soup
+                    text = container.get_text("\n", strip=True)
+                else:
+                    text = raw
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
             text = _html.unescape(text)
 
@@ -7103,7 +7187,7 @@ class IsaicBot:
             if len(parts) >= 2:
                 title = message.content.split(maxsplit=1)[1].strip()
             else:
-                title = re.sub(r"\.(txt|html|htm|md)$", "", attachment.filename, flags=re.IGNORECASE)
+                title = re.sub(r"\.(txt|html|htm|md|pdf)$", "", attachment.filename, flags=re.IGNORECASE)
 
             # Best-effort chapter detection. Looks for heading-shaped lines:
             # "Chapter N", "Chapter N: Title", "Prologue", "Epilogue",
@@ -7144,6 +7228,16 @@ class IsaicBot:
             ]
             if cant_fit:
                 lines.append(f"  ⚠️  Won't fit for: {', '.join(cant_fit)}")
+            if is_pdf and pdf_page_count:
+                avg_chars = len(text) // pdf_page_count
+                if avg_chars < 100:
+                    # A normal book page extracts to ~1,500-2,500 chars; way
+                    # under that usually means a partially scanned PDF.
+                    lines.append(
+                        f"  ⚠️  PDF extraction looks thin (~{avg_chars} chars/page over "
+                        f"{pdf_page_count} pages) — if the PDF is scanned, most of the "
+                        "text may be missing. OCR → `.txt` is the reliable route."
+                    )
             lines.append("\nPinned to this channel. Use `!unload` when done.")
             await message.channel.send("\n".join(lines))
 
@@ -7587,7 +7681,7 @@ effort level is shown in the response routing.
 
 **Bookclub mode (pinned long texts):**
 `!load <url>` - Load an AO3 work into this channel's context
-`!load_text [title]` - (with .txt/.html/.md attachment) load from a file — works when AO3 is shields-up
+`!load_text [title]` - (with .txt/.html/.md/.pdf attachment) load from a file — works when AO3 is shields-up
 `!chapters` - Show the chapter table of contents with per-chapter token counts
 `!scope chapter N` / `!scope chapters N-M` - (in a thread) restrict that thread to a chapter range so models only see those chapters — spoiler-safe + much cheaper per turn
 `!unscope` - (in a thread) drop the scope and use the parent channel's full work
