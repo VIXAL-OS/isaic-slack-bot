@@ -359,6 +359,13 @@ class ModelProvider:
     #   Deepseek V4 has this; Gemini does not.
     requires_reasoning_echo: bool = False
     disables_thinking_by_default: bool = False
+    # think_reasoning_effort: value sent as the OpenAI-standard
+    #   `reasoning_effort` param when thinking mode is requested. Kimi K3
+    #   accepts ONLY "max" here, and the K2-era extra_body {"thinking": ...}
+    #   param must NOT be sent to it (per Moonshot's K3 docs) — its reasoning
+    #   is internal, no reasoning_content echo. None (default) → the shim
+    #   never sends reasoning_effort.
+    think_reasoning_effort: Optional[str] = None
 
     # Which SearchBackend to use when this provider needs to ground via the web.
     # Values: "tavily", "google_native", or None (no external search). Claude has
@@ -586,7 +593,7 @@ AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "F
 # never fully stopped the echo — this strip is the real fix. ⚠️ KEEP IN SYNC
 # with provider.name when adding a head (else its echo leaks through, the
 # "[Qwen] [Qwen]" double-label bug).
-MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM|Dummy"
+MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM|Kimi|Dummy"
 
 
 CLAUDE_PROVIDER = ModelProvider(
@@ -594,7 +601,7 @@ CLAUDE_PROVIDER = ModelProvider(
     id="claude",
     sdk_type="anthropic",
     api_key_env="ANTHROPIC_API_KEY",
-    model_id="claude-opus-4-8",
+    model_id="claude-opus-5",
     input_cost_per_million=5.0,
     output_cost_per_million=25.0,
     # cache_read_input_tokens bill at 10% of standard input rate. (Cache
@@ -792,9 +799,9 @@ QWEN_PROVIDER = ModelProvider(
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/qwen3p7-plus",
-    input_cost_per_million=0.50,         # VERIFY on Fireworks pricing page
-    output_cost_per_million=3.00,
-    cached_input_cost_per_million=0.25,
+    input_cost_per_million=0.40,         # verified fireworks.ai/models 2026-08-02
+    output_cost_per_million=1.60,
+    cached_input_cost_per_million=0.08,  # Fireworks cached input is 0.2× here (not the assumed 0.5×)
     max_context_tokens=256_000,
     supports_vision=False,
     supports_web_search=False,
@@ -811,9 +818,9 @@ GLM_PROVIDER = ModelProvider(
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/glm-5p2",
-    input_cost_per_million=1.40,         # VERIFY on Fireworks pricing page
+    input_cost_per_million=1.40,         # verified fireworks.ai/models 2026-08-02
     output_cost_per_million=4.40,
-    cached_input_cost_per_million=0.70,
+    cached_input_cost_per_million=0.14,  # Fireworks cached input is 0.1× here (not the assumed 0.5×)
     max_context_tokens=200_000,
     supports_vision=False,
     supports_web_search=False,
@@ -821,6 +828,59 @@ GLM_PROVIDER = ModelProvider(
     est_wh_per_1k_tokens=0.45,  # 744B — larger
     grid_gco2_per_kwh=400.0,    # Fireworks US fleet
     train_tco2e=2000.0,         # estimate — GLM-5 (744B) trains end-to-end on Huawei Ascend; CN province grid
+)
+
+KIMI_PROVIDER = ModelProvider(
+    name="Kimi",
+    id="kimi",
+    sdk_type="openai_compatible",
+    api_key_env="FIREWORKS_API_KEY",
+    base_url="https://api.fireworks.ai/inference/v1",
+    backend="fireworks",
+    # Kimi K3 (Moonshot AI, released 2026-07-16; open weights 2026-07-27):
+    # 2.8T-param sparse MoE (16 of 896 experts ≈ ~50B active), Kimi Delta
+    # Attention (~6.3× faster decode at 1M ctx), 1M context. Largest
+    # open-weights model to date. PREMIUM open head — $3/$15 puts it above
+    # Claude on input, so it's override-only in routing (cost-safety).
+    # ⚠️ LAB-BOT DELTA vs upstream Opus-Deipseek: the DEFAULT backend here is
+    # **Fireworks serverless** (US, ZDR, shares FIREWORKS_API_KEY with
+    # Qwen/GLM) — NOT api.moonshot.ai. Egress discipline: the China-resident
+    # Moonshot API stays OFF the lab bot (upstream CLAUDE.md rule); the
+    # "moonshot" backend below exists only for parity with upstream.
+    model_id="accounts/fireworks/models/kimi-k3",   # verified live on serverless 2026-08-02
+    input_cost_per_million=3.00,        # Fireworks matches Moonshot's own rates exactly
+    output_cost_per_million=15.00,
+    cached_input_cost_per_million=0.30, # 0.1× — same cached rate as Moonshot's auto-cache
+    max_context_tokens=1_000_000,
+    # K3 is multimodal upstream, but vision stays OFF like the other open
+    # heads — Claude/Gemini are the designated eyes (deliberate, not a gap).
+    supports_vision=False,
+    supports_web_search=False,
+    search_backend="tavily",
+    # K3 thinking quirk: reasoning is requested via the OpenAI-standard
+    # reasoning_effort param — "max" is the ONLY value K3 accepts — and the
+    # K2.x extra_body {"thinking": ...} shape must NOT be sent (K3 rejects
+    # it). No reasoning_content echo requirement. ⚠️ VERIFY that Fireworks'
+    # shim forwards reasoning_effort for kimi-k3 on the first live !think turn.
+    think_reasoning_effort="max",
+    est_wh_per_1k_tokens=0.5,   # VERIFY — huge total params but sparse (~50B active) + KDA decode wins
+    grid_gco2_per_kwh=400.0,    # Fireworks US fleet
+    train_tco2e=4000.0,         # estimate — biggest open train to date; embodied at the CN training grid
+    # Backend toggle (Phase 3 pattern). Default = the Fireworks fields above.
+    # "moonshot" = Kimi's native API — kept for parity with the Discord bot,
+    # but DO NOT enable it here (China-resident endpoint; lab egress rule).
+    backends={
+        "moonshot": {
+            "base_url": "https://api.moonshot.ai/v1",
+            "api_key_env": "MOONSHOT_API_KEY",
+            "model": "kimi-k3",
+            "input_cost_per_million": 3.00,
+            "output_cost_per_million": 15.00,
+            "cached_input_cost_per_million": 0.30,
+            "grid_gco2_per_kwh": 550.0,   # Moonshot China API (east-CN grid)
+            "supports_server_cache": True,
+        },
+    },
 )
 
 # Phase 7 — simulator mode (§9). The "Dummy Plug": EVA's autopilot that runs an
@@ -952,6 +1012,7 @@ _PROVIDER_CONSTANTS = [
     MISTRAL_PROVIDER,
     QWEN_PROVIDER,
     GLM_PROVIDER,
+    KIMI_PROVIDER,
     SIM_PROVIDER,   # Phase 7 simulator (Dummy Plug) — last so it sorts after the heads in !models
 ]
 
@@ -2085,6 +2146,7 @@ class IsaicBot:
         self.mistral_provider = self.registry.by_id("mistral")
         self.qwen_provider = self.registry.by_id("qwen")
         self.glm_provider = self.registry.by_id("glm")
+        self.kimi_provider = self.registry.by_id("kimi")
         self.sim_provider = self.registry.by_id("sim")   # Phase 7 simulator (Dummy Plug)
 
         # Bookclub Gemini caching mode. Default: INLINE (False). A loaded book is
@@ -2155,14 +2217,15 @@ class IsaicBot:
         # already pay for — no GPT. (Fable 5 is intentionally omitted: not
         # generally accessible yet.) Disabled members are skipped at runtime.
         self.panel_members: list[str] = ["Claude", "Gemini", "Deepseek"]
-        # `!research all` convenes the full roster — the cheap Fireworks heads
-        # (Mistral/Qwen/GLM) join for maximum decorrelated diversity. Different
-        # training data → independent errors → a better judge synthesis: a panel
-        # *rewards* the redundancy a router would punish. Filtered by `enabled`,
-        # so they're silently skipped until FIREWORKS_API_KEY turns them on —
-        # this list is forward-compatible today (no GPT, per the panel charter).
+        # `!research all` convenes the full roster — the open heads
+        # (Mistral/Qwen/GLM/Kimi) join for maximum decorrelated diversity.
+        # Different training data → independent errors → a better judge
+        # synthesis: a panel *rewards* the redundancy a router would punish.
+        # Filtered by `enabled`, so each is silently skipped until its key
+        # (FIREWORKS/MISTRAL_API_KEY — Kimi rides the Fireworks key here)
+        # turns it on — forward-compatible today (no GPT, per the charter).
         self.panel_members_all: list[str] = [
-            "Claude", "Gemini", "Deepseek", "Mistral", "Qwen", "GLM",
+            "Claude", "Gemini", "Deepseek", "Mistral", "Qwen", "GLM", "Kimi",
         ]
         self.panel_judge: str = "Claude"
 
@@ -2248,6 +2311,7 @@ class IsaicBot:
         "mistral":  ("!mistral",),
         "qwen":     ("!qwen",),
         "glm":      ("!glm",),
+        "kimi":     ("!kimi", "!k3"),
         "sim":      ("!sim",),
     }
     # One-line factual role blurbs for !help (theme-independent; the name + alias
@@ -2259,6 +2323,7 @@ class IsaicBot:
         "mistral":  "French/EU specialist (needs MISTRAL_API_KEY)",
         "qwen":     "cheap coder/mathematician (needs FIREWORKS_API_KEY)",
         "glm":      "agentic open head (needs FIREWORKS_API_KEY)",
+        "kimi":     "frontier open head — 2.8T MoE, 1M ctx, premium $ (Fireworks; needs FIREWORKS_API_KEY)",
         "sim":      "simulator mode — a base model continues the transcript (override-only; needs providers.sim)",
     }
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
@@ -2323,7 +2388,7 @@ class IsaicBot:
 
     @staticmethod
     def _pick_effort(text: str, prev_used_thinking: bool = False) -> Optional[str]:
-        """Classify a prompt into an Opus 4.8 thinking-effort level.
+        """Classify a prompt into an Opus 5 thinking-effort level.
 
         Returns None | "high" | "xhigh" | "max". None means thinking off
         (cheap chat path). Casual register and first-person emotional
@@ -2566,7 +2631,7 @@ class IsaicBot:
 
         # Disabled-provider guards for explicit invocations (themed names + the
         # provider's real key env). The 6 instruct heads first, then the sim.
-        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm"):
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "kimi"):
             if pid in flags:
                 prov = self.registry.by_id(pid)
                 if prov is None or not prov.enabled:
@@ -2587,7 +2652,7 @@ class IsaicBot:
         # order (so stacked prefixes resolve deterministically as before).
         forced_provider = None
         routing_reason = ""
-        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "sim"):
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "kimi", "sim"):
             if pid in flags:
                 forced_provider = self.registry.by_id(pid)
                 disp = forced_provider.display_name or forced_provider.name
@@ -2952,6 +3017,16 @@ class IsaicBot:
                 "answer directly, never prepend your own name tag. You can't see images; you can "
                 "search via Tavily. You shine at agentic, tool-using, and coding tasks. Respond "
                 "in English, in flowing prose (not listicles) — this is Slack chat. Minimize blank lines."
+            )
+        elif provider.name == "Kimi":
+            identity = f"Kimi (model: {provider.model_id}), an AI assistant made by Moonshot AI (served via Fireworks)"
+            identity_details = (
+                "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
+                "different models, not you. The bot auto-prefixes your reply with **[Kimi]** — "
+                "answer directly, never prepend your own name tag. You can't see images; you can "
+                "search via Tavily. You're the largest open-weights head here (Kimi K3) — you "
+                "shine at hard reasoning, agentic work, and very long context. Respond in "
+                "English, in flowing prose (not listicles) — this is Slack chat. Minimize blank lines."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
@@ -4211,6 +4286,13 @@ class IsaicBot:
             # Override-only via !glm/!asuka: keep it out of the auto-router.
             score -= 0.5
 
+        elif provider.name == "Kimi":
+            # Kimi (K3) — the PREMIUM open head ($3/$15, above Claude on input).
+            # Letting it win the argmax would be a silent cost surprise next to
+            # Deepseek. Override-only via !kimi/!k3 (or !prefer kimi) — the spec
+            # default for new heads, and here it's also the cost-safe call.
+            score -= 0.5
+
         return max(0.0, min(1.0, score))
 
     @staticmethod
@@ -4381,6 +4463,11 @@ class IsaicBot:
                 extra_body["thinking"] = {"type": "disabled"}
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
+            if thinking and provider.think_reasoning_effort:
+                # Kimi K3 style: thinking is requested via the OpenAI-standard
+                # reasoning_effort param (K3 accepts only "max") — NOT the
+                # extra_body {"thinking": ...} shape, which K3 rejects.
+                api_kwargs["reasoning_effort"] = provider.think_reasoning_effort
             if tools:
                 api_kwargs["tools"] = tools
 
@@ -5408,7 +5495,7 @@ class IsaicBot:
             if tools:
                 claude_kwargs["tools"] = tools
             if thinking:
-                # Adaptive thinking on Opus 4.8: model decides depth; effort
+                # Adaptive thinking on Opus 5: model decides depth; effort
                 # controls overall thinking/acting budget. effort=None falls
                 # back to the class default ("high"). xhigh/max need ≥64K
                 # max_tokens or they truncate mid-thought.
@@ -5422,6 +5509,14 @@ class IsaicBot:
                 )
                 claude_kwargs["thinking"] = {"type": "adaptive"}
                 claude_kwargs["extra_body"] = {"output_config": {"effort": chosen_effort}}
+            else:
+                # Opus 5 flips the default: an omitted `thinking` param runs
+                # ADAPTIVE (on ≤4.8 it meant off). Disable explicitly so plain
+                # turns keep the old cost/latency profile and thinking tokens
+                # can't eat the 4096-token max_tokens cap. Safe because effort
+                # is only ever sent on the thinking path (disabled thinking +
+                # effort xhigh/max would 400).
+                claude_kwargs["thinking"] = {"type": "disabled"}
 
             api_messages = self._strip_internal_keys(messages)
             response = await asyncio.to_thread(
@@ -5579,7 +5674,17 @@ class IsaicBot:
         systematic Gemini outage behind an unreadable stub."""
         async def run_one(provider: ModelProvider):
             try:
-                text = await self._panel_complete(provider, guild_id, list(messages), system)
+                # Claude-as-panelist runs FULL thinking (adaptive @ high effort,
+                # 16K cap) with its default web_search — Sarah's call 2026-08-02:
+                # the premium head should dig, not skim at the plain adaptive-low
+                # tier. Non-Claude members keep thinking=False (unchanged panel
+                # cost/behavior); the judge separately passes thinking=True in
+                # _judge. Recaps/G2P hit _panel_complete directly, so they stay
+                # on the default (adaptive-low for Claude).
+                text = await self._panel_complete(
+                    provider, guild_id, list(messages), system,
+                    thinking=(provider is self.claude_provider),
+                )
             except Exception as e:
                 print(f"⚠️  Panel member {provider.name} raised: {e}")
                 return provider, None, f"{type(e).__name__}: {e}"
@@ -5662,7 +5767,11 @@ class IsaicBot:
             "You are a helpful assistant performing a web search. "
             "Use the web_search tool to find current information, then provide a clear, "
             "well-cited answer. Be concise but thorough. Reference earlier conversation "
-            "when the search query depends on it (e.g. 'links for what you said earlier')."
+            "when the search query depends on it (e.g. 'links for what you said earlier'). "
+            # Opus 5 with thinking disabled can occasionally verbalize a tool
+            # call into text instead of emitting a tool_use block (silent no-op
+            # search). Anthropic's documented mitigation is granting a preamble:
+            "You may say a brief sentence before using a tool."
         )
         if memory_context:
             system += f"\n\nContext about the user/server:\n{memory_context}"
@@ -5685,6 +5794,9 @@ class IsaicBot:
                 self.claude_client.messages.create,
                 model=self.claude_provider.model_id,
                 max_tokens=self.claude_provider.max_tokens,
+                # Opus 5 defaults to adaptive thinking when the param is
+                # omitted; keep !search on the old no-thinking profile.
+                thinking={"type": "disabled"},
                 system=system,
                 messages=messages,
                 tools=[{
@@ -5725,6 +5837,7 @@ class IsaicBot:
                     self.claude_client.messages.create,
                     model=self.claude_provider.model_id,
                     max_tokens=self.claude_provider.max_tokens,
+                    thinking={"type": "disabled"},
                     system=system,
                     messages=messages,
                     tools=[{
@@ -6682,8 +6795,8 @@ class IsaicBot:
                     "Convenes a multi-model panel — each model answers independently, then a "
                     "judge synthesises them into one answer.\n"
                     "• `!research` — lean core panel (Claude · Gemini · Deepseek).\n"
-                    "• `!research all` — full roster, adding the cheap Fireworks heads "
-                    "(Mistral/Qwen/GLM) for max diversity once they're configured.\n"
+                    "• `!research all` — full roster, adding the open heads "
+                    "(Mistral/Qwen/GLM/Kimi) for max diversity once they're configured.\n"
                     "⚠️ Runs several models (each may web-search) per call — roughly 3–4× the "
                     "cost and latency of a normal reply (more with `all`)."
                 )
@@ -6920,6 +7033,10 @@ class IsaicBot:
                             self.claude_client.messages.create,
                             model=self.claude_provider.model_id,
                             max_tokens=200,
+                            # Must stay disabled on Opus 5: default-on adaptive
+                            # thinking would both blow the 200-token cap and put
+                            # a thinking block at content[0] (crashing .text).
+                            thinking={"type": "disabled"},
                             system="Summarize this conversation in 1-2 sentences. Focus on the key topic and any decisions/outcomes. Be concise.",
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
@@ -7655,7 +7772,7 @@ class IsaicBot:
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
-`!research all <question>` - Full roster (adds Mistral/Qwen/GLM when configured) for max diversity
+`!research all <question>` - Full roster (adds Mistral/Qwen/GLM/Kimi when configured) for max diversity
 `!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
    (models can also voice phrases inline while teaching, via `!speak 汉字`)
 `!french <french / english phrase>` - French TTS in natural fr-FR (Azure Denise) + IPA & liaison note → MP3 (needs AZURE_TTS_KEY)
@@ -7665,7 +7782,7 @@ __MM_BLOCK__
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
-`!prefer [claude|deepseek|gemini|mistral|qwen|glm|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
+`!prefer [claude|deepseek|gemini|mistral|qwen|glm|kimi|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.

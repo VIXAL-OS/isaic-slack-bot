@@ -7,19 +7,21 @@
 
 A **Slack-native, multi-model assistant**: Claude, Gemini, and Deepseek share one bot with smart
 heuristic routing, shared two-tier memory, web search/grounding, prompt caching, and "bookclub" mode
-for discussing long texts. Open-weight heads — **Mistral**, **Qwen**, **GLM** (one Fireworks
-endpoint) — and a base-model **simulator** join when configured.
+for discussing long texts. Open-weight heads — **Mistral**, plus **Qwen**, **GLM**, and **Kimi K3**
+on one Fireworks endpoint (US, zero-data-retention) — and a base-model **simulator** join when
+configured.
 
 The heads are skinned as the **twelve tribes** (the default `isaic` theme):
 
 | Head | Model | Summon with |
 |---|---|---|
-| **Judah** | Claude (Opus 4.8) | `!judah` / `!claude` |
+| **Judah** | Claude (Opus 5) | `!judah` / `!claude` |
 | **Joseph** | Gemini (3.1 Pro) | `!joseph` / `!gemini` |
 | **Zebulun** | Deepseek (V4-Pro) | `!zebulun` / `!deepseek` |
 | **Naphtali** | Mistral (Large 3) | `!naphtali` / `!mistral` |
 | **Benjamin** | Qwen (Fireworks) | `!benjamin` / `!qwen` |
 | **Gad** | GLM (Fireworks) | `!gad` / `!glm` |
+| **Issachar** | Kimi K3 (Fireworks) | `!issachar` / `!kimi` / `!k3` |
 | **Levi** | base-model simulator | `!levi` / `!sim` |
 
 > This is a **Slack** port of a Discord bot. It is **architecturally complete but has not yet been

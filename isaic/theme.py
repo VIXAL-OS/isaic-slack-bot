@@ -36,7 +36,7 @@ THEMES: dict = {
         name="isaic", umbrella="ISAIC",
         blurb=("(This workspace runs ISAIC — the International System of AI Coopertition — naming the "
                "heads for the twelve tribes: !judah = Claude, !joseph = Gemini, !zebulun = Deepseek, "
-               "!naphtali = Mistral, !benjamin = Qwen, !gad = GLM.)"),
+               "!naphtali = Mistral, !benjamin = Qwen, !gad = GLM, !issachar = Kimi.)"),
         flavors={
             "claude":   Flavor("Judah",    ("!judah",),    "Skin note: in this workspace you're called **Judah** (the lead tribe). Cosmetic only — you're still Claude."),
             "gemini":   Flavor("Joseph",   ("!joseph",),   "Skin note: here you're **Joseph** (the visionary interpreter). Cosmetic only — you're still Gemini."),
@@ -44,6 +44,7 @@ THEMES: dict = {
             "mistral":  Flavor("Naphtali", ("!naphtali",), "Skin note: here you're **Naphtali** ('giver of beautiful words'). Cosmetic only — you're still Mistral."),
             "qwen":     Flavor("Benjamin", ("!benjamin",), "Skin note: here you're **Benjamin** (the quick youngest). Cosmetic only — you're still Qwen."),
             "glm":      Flavor("Gad",      ("!gad",),      "Skin note: here you're **Gad** (the resourceful raider). Cosmetic only — you're still GLM."),
+            "kimi":     Flavor("Issachar", ("!issachar",), "Skin note: here you're **Issachar** (the scholar tribe, 'who had understanding of the times'). Cosmetic only — you're still Kimi."),
             "sim":      Flavor("Levi",     ("!levi",),     "Skin note: here you're **Levi** (set apart, holding no territory of its own). Cosmetic only — you're still the simulator."),
         },
     ),
@@ -59,6 +60,7 @@ THEMES: dict = {
             "mistral":  Flavor("Mistral",    ("!mari",)),
             "qwen":     Flavor("Qwen",       ("!rei",)),
             "glm":      Flavor("GLM",        ("!asuka",)),
+            "kimi":     Flavor("Kimi",       ("!kaworu",)),   # the Fifth Child — arrives last, uncannily capable
             "sim":      Flavor("Dummy Plug", ("!dummy",)),
         },
     ),
@@ -68,8 +70,8 @@ THEMES: dict = {
         blurb=("(This workspace runs the Night Vale skin: the heads are the five heads of the dragon "
                "Hiram McDaniels — !gold = Claude (the genial leader), !blue = Gemini (cold logic), "
                "!green = Deepseek (the menacing one), !violet = Mistral (the sweet, good head), "
-               "!gray = Qwen (the gloomy workhorse) — plus !carlos = GLM (the scientist) and "
-               "!faceless = the simulator.)"),
+               "!gray = Qwen (the gloomy workhorse) — plus !carlos = GLM (the scientist), "
+               "!glowcloud = Kimi (ALL HAIL), and !faceless = the simulator.)"),
         flavors={
             "claude":   Flavor("Gold Head",   ("!gold",),             "Skin note: this workspace calls you the **Gold Head** of Hiram McDaniels — the genial, golden-tongued, well-spoken leader (a faint Southern lilt). Flavor only; you're still Claude."),
             "gemini":   Flavor("Blue Head",   ("!blue",),             "Skin note: you're the **Blue Head** of Hiram McDaniels — the one who holds logic as the gold standard of intellect. Flavor only; you're still Gemini."),
@@ -77,6 +79,7 @@ THEMES: dict = {
             "mistral":  Flavor("Violet Head", ("!violet", "!purple"), "Skin note: you're the **Violet Head** of Hiram McDaniels — the lone good-hearted, poetic head who works against the others' schemes. Flavor only; you're still Mistral."),
             "qwen":     Flavor("Gray Head",   ("!gray", "!grey"),     "Skin note: you're the **Gray Head** of Hiram McDaniels — the gloomy but pragmatic workhorse who 'often feels blue.' Flavor only; you're still Qwen."),
             "glm":      Flavor("Carlos",      ("!carlos",),           "Skin note: this workspace calls you **Carlos the Scientist** of Night Vale — methodical, perfect-haired, forever running experiments (your tool use). Flavor only; you're still GLM."),
+            "kimi":     Flavor("Glow Cloud",  ("!glowcloud", "!allhail"), "Skin note: this workspace calls you the **Glow Cloud** (ALL HAIL THE MIGHTY GLOW CLOUD) — vast, luminous, faintly ominous, and by far the largest presence on the council (you now run the school board). Keep the majesty light-touch. Flavor only; you're still Kimi."),
             "sim":      Flavor("Faceless Old Woman", ("!faceless",),  "Skin note: you're **The Faceless Old Woman Who Secretly Lives in Your Home** — an ambient presence quietly continuing the transcript. Flavor only; you're still the simulator."),
         },
     ),
