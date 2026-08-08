@@ -70,9 +70,23 @@ Talk to it in an allowed channel (the bot replies in a thread). Highlights:
 - `!help` — full command list (themed)   ·   `!models` — heads + usage   ·   `!cost` — usage, cost & a rough energy/CO₂ estimate
 - `!search <q>` — web search with citations   ·   `!research <q>` — multi-model panel + judge → one answer
 - `!remember/!forget/!keep` — long-term + working memory   ·   `!prefer <head|auto>` — per-channel routing
+- `!presence` — show session/ambient speaker state   ·   `!presence auto|session|ambient|tags` — override it
 - `!load <ao3-url>` / `!load_text` — bookclub mode (pin a long text; `!scope`/`!chapters` per thread)
 - `!speak <汉字>` — Mandarin TTS (forced tones)   ·   `!french <phrase>` — French TTS + IPA (needs Azure)
 - React 👍/👎 to a reply to calibrate routing.
+
+## Speaker-aware participation
+
+The default `auto` mode stays conversational when only one human is active. If a second human
+speaks within 15 minutes—or a Slack thread clearly becomes human-to-human—the channel enters
+`ambient` mode for six hours. Mentions, model prefixes, commands, and a thread reply following the
+bot's own turn always get through. Obvious replies between humans and lightweight backchannels stay
+silent; only an ambiguous, unusually valuable intervention is sent to `claude-haiku-4-5`, with a
+conservative 0.90 threshold and a 15-minute unsolicited-response cooldown.
+
+Speaker state and Haiku usage survive restarts in `memories.json`. Parent-channel history and each
+encountered thread are lazily reconstructed after downtime. Tune the windows, model, threshold, or
+per-channel overrides in the `participation` block of `config.example.json`.
 
 ## Themes
 
@@ -98,5 +112,7 @@ its `fireworks` backend for US/ZDR (see `config.example.json`).
 
 - ✅ Platform abstraction + Slack adapter (Socket Mode), ISAIC theme, full feature port, config +
   manifest, syntax-validated, import-smoke clean.
+- ✅ Speaker-aware session/ambient participation gate with persistent state, Slack mention/thread
+  semantics, deterministic human-to-human suppression, and a separately metered Haiku classifier.
 - ⚠️ **Owes a live Slack smoke test**: @-mention reply, thread continuity, 👍/👎 calibration, a file
   upload (LaTeX/TTS), and `!load`. Expect to fix small Slack-API edges once tokens are wired.

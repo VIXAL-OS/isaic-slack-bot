@@ -159,7 +159,11 @@ class SlackAdapter:
 
     async def _build_message(self, event: dict) -> Message:
         channel = event.get("channel", "")
-        text = self._strip_leading_mention(event.get("text", "") or "")
+        raw_text = event.get("text", "") or ""
+        mentions_bot = bool(
+            self.bot_user_id and f"<@{self.bot_user_id}>" in raw_text
+        )
+        text = self._strip_leading_mention(raw_text)
         files = event.get("files", []) or []
         return Message(
             id=event.get("ts", ""),
@@ -171,6 +175,7 @@ class SlackAdapter:
             attachments=[self._to_attachment(f) for f in files],
             is_bot=bool(event.get("bot_id")),
             is_self=event.get("user") == self.bot_user_id,
+            mentions_bot=mentions_bot,
             platform="slack",
             reply_to_text=None,
             raw=event,
@@ -223,7 +228,7 @@ class SlackAdapter:
                 continue
             is_bot = bool(m.get("bot_id"))
             uid = m.get("user", "") or ""
-            is_self = uid == self.bot_user_id or is_bot
+            is_self = uid == self.bot_user_id
             name = "assistant" if is_self else await self.resolve_user_name(uid)
             out.append(Message(
                 id=m.get("ts", ""),
@@ -235,6 +240,10 @@ class SlackAdapter:
                 attachments=[self._to_attachment(f) for f in (m.get("files", []) or [])],
                 is_bot=is_bot,
                 is_self=is_self,
+                mentions_bot=bool(
+                    self.bot_user_id
+                    and f"<@{self.bot_user_id}>" in (m.get("text", "") or "")
+                ),
                 platform="slack",
                 raw=m,
             ))

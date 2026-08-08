@@ -17,6 +17,7 @@ channel or a thread; threads share their parent channel's id and carry a
 from __future__ import annotations
 
 import io
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -237,6 +238,10 @@ class Message:
         self._platform = platform
         self._pm = pm
         self.id = pm.id
+        try:
+            self.created_at = datetime.fromtimestamp(float(pm.id), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            self.created_at = datetime.now(timezone.utc)
         self.content = pm.text or ""
         self.author = _Author(pm.author_id, pm.author_name, pm.is_bot or pm.is_self)
         self.channel = OutChannel(platform, pm.channel_id,
@@ -246,6 +251,10 @@ class Message:
         self.webhook_id = None          # no webhook proxies on Slack
         self.type = MessageType.default
         self.is_self = pm.is_self
+        self.mentions = (
+            [SimpleNamespace(id=getattr(platform, "bot_user_id", ""))]
+            if pm.mentions_bot else []
+        )
         # reply-to context (best effort): the platform resolves the parent text.
         if pm.reply_to_text:
             self.reference = SimpleNamespace(

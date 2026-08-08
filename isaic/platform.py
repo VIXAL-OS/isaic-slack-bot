@@ -40,6 +40,7 @@ class Message:
     attachments: list[Attachment] = field(default_factory=list)
     is_bot: bool = False                      # author is any bot/app
     is_self: bool = False                     # author is THIS bot
+    mentions_bot: bool = False                # raw text explicitly mentioned THIS bot
     platform: str = "slack"
     reply_to_text: Optional[str] = None       # resolved parent/quoted text (replaces msg.reference)
     raw: Any = None                           # the original event payload, if an adapter needs it

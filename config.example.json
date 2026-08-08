@@ -13,6 +13,20 @@
 
   "_providers_comment": "OPTIONAL. Omit 'providers' to keep defaults (each head enabled iff its API key is present, on its default backend). When present it OVERRIDES per-provider: enabled / backend / model / routing_tags, and per-backend sub-blocks (e.g. self_hosted).",
 
+  "_participation_comment": "Automatic social gate. One active speaker gets session mode (the bot answers normally). A second speaker inside activation_minutes, or a human replying to another human in a Slack thread, starts ambient mode. Mentions, replies after the bot's own thread turn, commands, and model prefixes always work; obvious human-to-human turns stay silent; ambiguous exceptional interventions use cheap Haiku. Speaker switches renew the ambient hold, one speaker alone does not. After solo_reset_hours without multi-speaker evidence, session mode returns. !presence shows or overrides this per channel.",
+  "participation": {
+    "enabled": true,
+    "solo_reset_hours": 6,
+    "activation_minutes": 15,
+    "cooldown_minutes": 15,
+    "classifier_enabled": true,
+    "classifier_model": "claude-haiku-4-5",
+    "classifier_threshold": 0.9,
+    "context_messages": 12,
+    "history_limit": 500,
+    "channel_modes": {}
+  },
+
   "providers": {
     "claude":   { "enabled": true,  "model": "claude-opus-5", "routing_tags": ["code", "careful", "vision"] },
     "gemini":   { "enabled": true,  "backend": "developer_api", "model": "gemini-3.1-pro-preview", "routing_tags": ["novel", "longcontext", "vision"] },
