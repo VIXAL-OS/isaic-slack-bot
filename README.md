@@ -17,7 +17,7 @@ The heads are skinned as the **twelve tribes** (the default `isaic` theme):
 |---|---|---|
 | **Judah** | Claude (Opus 5) | `!judah` / `!claude` |
 | **Joseph** | Gemini (3.1 Pro) | `!joseph` / `!gemini` |
-| **Zebulun** | Deepseek (V4-Pro) | `!zebulun` / `!deepseek` |
+| **Zebulun** | Deepseek (V4.1 Flash) | `!zebulun` / `!deepseek` |
 | **Naphtali** | Mistral (Large 3) | `!naphtali` / `!mistral` |
 | **Benjamin** | Qwen (Fireworks) | `!benjamin` / `!qwen` |
 | **Gad** | GLM (Fireworks) | `!gad` / `!glm` |

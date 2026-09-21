@@ -341,12 +341,24 @@ class ModelProvider:
     # bill at this (much lower) rate. Set on providers that support caching
     # AND where we extract the cache-hit count from the usage response.
     # Claude: cache_read_input_tokens (~10% of input rate).
-    # Deepseek: prompt_cache_hit_tokens (~99% off via auto-server-cache).
+    # Deepseek: prompt_cache_hit_tokens (~98% off via auto-server-cache).
+    # Fireworks / Alibaba: prompt_tokens_details.cached_tokens (per-model rate)
+    # — both read by _usage_cache_hits in the OpenAI-compatible shim.
     # Gemini native: usageMetadata.cachedContentTokenCount (~25% of input
-    # rate). The OpenAI shim doesn't expose Gemini's cache info, so cache
-    # accounting only kicks in for the native chat path.
+    # rate). Over the OpenAI shim, Gemini hits count only if Google fills
+    # the standard prompt_tokens_details.cached_tokens (unverified live);
+    # a head with hits but no cache rate falls back to the input rate.
     cached_input_cost_per_million: Optional[float] = None
     cached_input_cost_per_million_above_tier: Optional[float] = None
+
+    # Time-of-day pricing: during any peak window EVERY billing item costs
+    # peak_multiplier × the (off-peak) rates above. Each window is
+    # (weekdays, start_hour, end_hour) in UTC, end exclusive, weekdays per
+    # datetime.weekday() (Mon=0). DeepSeek's native API since 2026-09-10.
+    # Metered in record_usage as a $ surcharge, so token buckets / energy stay
+    # untouched. Empty → flat pricing.
+    peak_windows_utc: tuple = ()
+    peak_multiplier: float = 1.0
 
     # Provider quirks for the OpenAI-compatible generator
     # ---------------------------------------------------
@@ -419,11 +431,30 @@ class ModelProvider:
     # !cost (see _create_gemini_cache / get_cost_summary).
     total_cache_storage_cost_est: float = 0.0
 
+    # Extra $ billed for requests made inside a peak window (see
+    # peak_windows_utc): (peak_multiplier - 1) × their base-rate cost.
+    total_peak_surcharge: float = 0.0
+
+    def is_peak(self, when: Optional[datetime] = None) -> bool:
+        """True if `when` (default: now) falls in one of this provider's
+        peak-pricing windows. Ignores public holidays (DeepSeek exempts
+        Chinese ones), so a holiday turn over-reports — the safe direction."""
+        if not self.peak_windows_utc or self.peak_multiplier == 1.0:
+            return False
+        # astimezone, not just _as_utc: weekday/hour must be read in UTC even
+        # for an aware non-UTC timestamp (_as_utc only tags naive ones).
+        when = (_as_utc(when) or _utcnow()).astimezone(timezone.utc)
+        return any(
+            when.weekday() in days and start <= when.hour < end
+            for days, start, end in self.peak_windows_utc
+        )
+
     def record_usage(
         self,
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        when: Optional[datetime] = None,
     ) -> None:
         """Record one request's usage, routing into the right tier bucket.
 
@@ -436,7 +467,11 @@ class ModelProvider:
         The total request size used for tier routing is uncached + cached,
         since the API still has to process that much context (and tier
         breakpoints are based on context size, not billing).
+
+        `when` (default now) decides peak vs off-peak for time-of-day pricing.
         """
+        peak = self.is_peak(when)
+        base_before = self._token_cost() if peak else 0.0
         request_size = input_tokens + cached_input_tokens
         if (
             self.context_tier_threshold is not None
@@ -449,9 +484,22 @@ class ModelProvider:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cached_input_tokens += cached_input_tokens
+        if peak:
+            # This request's base-rate cost is the delta it just added; bill the
+            # rest of the peak price on top as a surcharge.
+            self.total_peak_surcharge += (
+                (self._token_cost() - base_before) * (self.peak_multiplier - 1.0)
+            )
 
     def get_cost(self) -> float:
-        """Get total cost for this provider across all pricing tiers and cache states."""
+        """Get total cost for this provider across all pricing tiers and cache
+        states, including any peak-hour surcharge."""
+        if self.cost_mode == "local":
+            return 0.0
+        return self._token_cost() + self.total_peak_surcharge
+
+    def _token_cost(self) -> float:
+        """Recorded tokens priced at the base (off-peak) rates."""
         # Local / self-hosted backends bill electricity, not per token, so there
         # is no $ figure to report. Tokens are still counted, so get_energy_wh /
         # get_co2_g still surface the carbon. See cost_mode + the "local" label
@@ -531,6 +579,7 @@ class ModelProvider:
             "cached_input_tokens_above_tier": self.total_cached_input_tokens_above_tier,
             "requests": self.total_requests,
             "cache_storage_cost_est": self.total_cache_storage_cost_est,
+            "peak_surcharge": self.total_peak_surcharge,
         }
 
     def load_stats(self, data: dict) -> None:
@@ -542,6 +591,7 @@ class ModelProvider:
         self.total_cached_input_tokens_above_tier = data.get("cached_input_tokens_above_tier", 0)
         self.total_requests = data.get("requests", 0)
         self.total_cache_storage_cost_est = data.get("cache_storage_cost_est", 0.0)
+        self.total_peak_surcharge = data.get("peak_surcharge", 0.0)
 
 
 @dataclass
@@ -623,13 +673,23 @@ DEEPSEEK_PROVIDER = ModelProvider(
     api_key_env="DEEPSEEK_API_KEY",
     base_url="https://api.deepseek.com",
     backend="api",
-    model_id="deepseek-v4-pro",
-    input_cost_per_million=0.435,
-    output_cost_per_million=0.87,
-    # Auto server-side prefix caching; cached input bills at ~99% off.
-    # (Both rates are current through the May 31 2026 promo discount.)
-    cached_input_cost_per_million=0.003625,
-    # 1M context per DeepSeek V4-Pro docs (max output 384k). Server-side
+    # V4.1 Flash (2026-09-10) beats V4 Pro on every coding/agent benchmark
+    # DeepSeek lists and trails only on GPQA/HLE, at ~1/4 the price. Sarah's
+    # call 2026-09-21. Thinking-off, thinking-on + reasoning echo, and a tool
+    # round-trip all verified live on this slug the same day.
+    model_id="deepseek-flash",
+    # Off-peak rates (api-docs.deepseek.com/quick_start/pricing, 2026-09-21).
+    # Peak (below) is 2× on every item. For reference V4 Pro is $0.66/$1.98,
+    # cache $0.022 off-peak — the old $0.435/$0.87 was an expired promo.
+    input_cost_per_million=0.15,
+    output_cost_per_million=0.60,
+    # Auto server-side prefix caching; cached input bills at ~98% off.
+    cached_input_cost_per_million=0.003,
+    # Peak 01:00–04:00 + 06:00–10:00 UTC, Mon–Fri (= Beijing 09–12 + 14–18).
+    # US Eastern: Sun–Thu 9pm–midnight + weekday 2–6am.
+    peak_windows_utc=(((0, 1, 2, 3, 4), 1, 4), ((0, 1, 2, 3, 4), 6, 10)),
+    peak_multiplier=2.0,
+    # 1M context per DeepSeek docs (max output 384k). Server-side
     # context caching is automatic — no client flags required.
     max_context_tokens=1_000_000,
     supports_vision=False,
@@ -640,7 +700,7 @@ DEEPSEEK_PROVIDER = ModelProvider(
     disables_thinking_by_default=True,
     # Deepseek has no native web search; route through Tavily.
     search_backend="tavily",
-    est_wh_per_1k_tokens=0.3,  # sparse MoE (~37B active) — light per token
+    est_wh_per_1k_tokens=0.2,  # V4.1 Flash: 552B MoE, ~8B active in / ~16B out (V4 Pro ~49B → was 0.3)
     grid_gco2_per_kwh=550.0,   # DeepSeek China API (east-CN grid; province-dependent — Sichuan hydro ~112, Inner Mongolia coal higher). fireworks backend → ~400; self-host → your grid
     train_tco2e=1000.0,        # ~1.4 GWh for V3 (2.78M GPU-hrs); V4 est. — very training-efficient
     # Backend toggle (Phase 3). Default "api" (above) = China api.deepseek.com.
@@ -648,13 +708,20 @@ DEEPSEEK_PROVIDER = ModelProvider(
     # these are the lab-route options. Selecting one overrides base_url / key /
     # model / cost / grid. ⚠️ Fireworks pricing + grid are estimates — VERIFY.
     backends={
-        "fireworks": {  # US, zero-data-retention, server-side cache (50%)
+        "fireworks": {  # US, zero-data-retention, server-side cache
             "base_url": "https://api.fireworks.ai/inference/v1",
             "api_key_env": "FIREWORKS_API_KEY",
-            "model": "accounts/fireworks/models/deepseek-v4-pro",
-            "input_cost_per_million": 1.74,          # VERIFY Fireworks pricing
-            "output_cost_per_million": 3.48,
-            "cached_input_cost_per_million": 0.87,   # Fireworks caches input at 50%
+            # V4 Pro left Fireworks serverless 2026-08-27 (its 0813 successor goes
+            # 2026-09-25); V4.1 Flash is the named replacement — so this backend
+            # now runs a DIFFERENT model than the "api" default. Slug + the
+            # thinking-disabled extra_body verified live 2026-09-21 (honored:
+            # 0 reasoning tokens). Price per docs.fireworks.ai (the /models listing shows
+            # $0.22/$0.66 instead) — VERIFY.
+            "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+            "input_cost_per_million": 0.30,
+            "output_cost_per_million": 1.20,
+            "cached_input_cost_per_million": 0.006,
+            "peak_windows_utc": (),                  # Fireworks bills flat
             "grid_gco2_per_kwh": 400.0,              # Fireworks US fleet
             "supports_server_cache": True,
         },
@@ -664,6 +731,7 @@ DEEPSEEK_PROVIDER = ModelProvider(
             "model": "deepseek-v4-flash",             # single-GPU; full V4 is multi-GPU
             "supports_server_cache": False,
             "cost_mode": "local",
+            "peak_windows_utc": (),
             "grid_gco2_per_kwh": None,                # your grid → global GRID_GCO2_PER_KWH
         },
     },
@@ -798,11 +866,15 @@ QWEN_PROVIDER = ModelProvider(
     sdk_type="openai_compatible",
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
-    model_id="accounts/fireworks/models/qwen3p7-plus",
-    input_cost_per_million=0.40,         # verified fireworks.ai/models 2026-08-02
-    output_cost_per_million=1.60,
-    cached_input_cost_per_million=0.08,  # Fireworks cached input is 0.2× here (not the assumed 0.5×)
-    max_context_tokens=256_000,
+    # Qwen 3.7 Plus left Fireworks serverless 2026-09-04 (404s since); 3.8 Max is
+    # Fireworks' named replacement and the ONLY serverless Qwen now (3.8 Flash
+    # Next / 27B are on-demand only). ~5x the old input price. Thinks by default
+    # (reasoning_content), no echo needed — tool round-trip verified live 2026-09-21.
+    model_id="accounts/fireworks/models/qwen3p8-max",
+    input_cost_per_million=2.00,         # verified docs.fireworks.ai/serverless/pricing 2026-09-21
+    output_cost_per_million=6.00,
+    cached_input_cost_per_million=0.25,  # Fireworks cached input is 0.125× here
+    max_context_tokens=256_000,          # carried over from 3.7 Plus — Fireworks doesn't list 3.8 Max's; VERIFY
     supports_vision=False,
     supports_web_search=False,
     search_backend="tavily",
@@ -817,11 +889,13 @@ GLM_PROVIDER = ModelProvider(
     sdk_type="openai_compatible",
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
-    model_id="accounts/fireworks/models/glm-5p2",
-    input_cost_per_million=1.40,         # verified fireworks.ai/models 2026-08-02
+    # GLM 5.2 leaves Fireworks serverless 2026-09-25; 5.3 is the named replacement
+    # (same $/token, pricier cache). Tool round-trip verified live 2026-09-21.
+    model_id="accounts/fireworks/models/glm-5p3",
+    input_cost_per_million=1.40,         # verified docs.fireworks.ai/serverless/pricing 2026-09-21
     output_cost_per_million=4.40,
-    cached_input_cost_per_million=0.14,  # Fireworks cached input is 0.1× here (not the assumed 0.5×)
-    max_context_tokens=200_000,
+    cached_input_cost_per_million=0.26,  # Fireworks cached input is ~0.19× here (5.2 was 0.1×)
+    max_context_tokens=1_048_576,        # 5.3 is 1M-ctx on Fireworks (5.2 was listed at 200k)
     supports_vision=False,
     supports_web_search=False,
     search_backend="tavily",
@@ -982,6 +1056,29 @@ def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def _usage_cache_hits(usage) -> int:
+    """Prompt-cache hits in an OpenAI-compatible `usage` block (SDK object or
+    dict; None → 0). DeepSeek reports them in its own `prompt_cache_hit_tokens`;
+    Fireworks, Alibaba Model Studio and other OpenAI-standard servers use
+    `prompt_tokens_details.cached_tokens`. DeepSeek may send BOTH for the same
+    hits, so its field wins when non-zero — the two are never summed."""
+    def field(obj, name):
+        if obj is None:
+            return None
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+    def as_int(val) -> int:
+        try:
+            return max(0, int(val or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    hits = as_int(field(usage, "prompt_cache_hit_tokens"))
+    if hits:
+        return hits
+    return as_int(field(field(usage, "prompt_tokens_details"), "cached_tokens"))
+
+
 def _gemini_storage_cost(
     tokens: int, created: datetime, expires: Optional[datetime], now: datetime
 ) -> float:
@@ -1031,6 +1128,7 @@ _BACKEND_FIELD_MAP = {
     "grid_gco2_per_kwh": "grid_gco2_per_kwh",
     "supports_server_cache": "supports_server_cache",
     "cost_mode": "cost_mode",
+    "peak_windows_utc": "peak_windows_utc",  # () = flat-priced backend
 }
 
 
@@ -2172,6 +2270,8 @@ class ConversationManager:
             # line below still reports (tokens are counted) on the self-host grid.
             cost_str = ("local (no per-token $ — electricity only)"
                         if p.cost_mode == "local" else f"${cost:.4f}")
+            if p.cost_mode != "local" and p.total_peak_surcharge > 0:
+                cost_str += f" (incl. ${p.total_peak_surcharge:.4f} peak-hour surcharge)"
             lines.append(
                 f"  **{p.name}**: {p.total_requests} requests, "
                 f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
@@ -2508,7 +2608,19 @@ class IsaicBot:
         # point for a language tutor. Free tier: 0.5M chars/month.
         self.azure_tts_key = os.getenv("AZURE_TTS_KEY")
         self.azure_tts_region = os.getenv("AZURE_TTS_REGION")
-        if self.azure_tts_key and self.azure_tts_region:
+        # Operator off-switch: AZURE_TTS_ENABLED=false parks TTS without
+        # deleting the keys (set 2026-09-21 — the free-credit subscription
+        # lapsed 2026-08-21, so the key is dead). Blanking the key makes every
+        # TTS path behave as unconfigured: no Azure calls, and inline
+        # [[speak:]] / [[french:]] markers collapse to plain text before any
+        # G2P LLM call. Unset or true → normal behavior.
+        self.azure_tts_switched_off = os.getenv("AZURE_TTS_ENABLED", "true").strip().lower() in (
+            "0", "false", "no", "off",
+        )
+        if self.azure_tts_switched_off:
+            self.azure_tts_key = None
+            print("⚪ Azure TTS switched off (AZURE_TTS_ENABLED=false — !speak / !french disabled)")
+        elif self.azure_tts_key and self.azure_tts_region:
             print(f"🟢 Azure Mandarin TTS enabled (region: {self.azure_tts_region})")
         else:
             print("⚪ Azure TTS not configured (AZURE_TTS_KEY / AZURE_TTS_REGION missing — !speak disabled)")
@@ -5122,10 +5234,11 @@ Return one JSON object only:
                 **api_kwargs,
             )
 
-            # Track usage. DeepSeek exposes prompt_cache_hit_tokens for
-            # server-side auto-cached input; subtract from prompt_tokens to
-            # get the uncached portion. Other providers / no cache → 0.
-            cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+            # Track usage. Server-side cache hits (DeepSeek's own field, or the
+            # OpenAI-standard prompt_tokens_details.cached_tokens on Fireworks /
+            # Alibaba) are subtracted from prompt_tokens to get the uncached
+            # portion. No cache → 0.
+            cached_hit = _usage_cache_hits(response.usage)
             uncached_input = max(0, response.usage.prompt_tokens - cached_hit)
             provider.record_usage(
                 uncached_input,
@@ -5201,7 +5314,7 @@ Return one JSON object only:
                 )
 
                 # Track additional usage (cache-aware, see above)
-                cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+                cached_hit = _usage_cache_hits(response.usage)
                 uncached_input = max(0, response.usage.prompt_tokens - cached_hit)
                 provider.record_usage(
                     uncached_input,
@@ -5248,7 +5361,7 @@ Return one JSON object only:
                     response = await asyncio.to_thread(
                         client.chat.completions.create, **retry_kwargs,
                     )
-                    cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+                    cached_hit = _usage_cache_hits(response.usage)
                     provider.record_usage(
                         max(0, response.usage.prompt_tokens - cached_hit),
                         response.usage.completion_tokens,
@@ -5563,7 +5676,7 @@ Return one JSON object only:
             # Usage / carbon — identical accounting to the chat path (§9.2).
             usage = getattr(response, "usage", None)
             if usage is not None:
-                cached_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                cached_hit = _usage_cache_hits(usage)
                 uncached_input = max(0, (usage.prompt_tokens or 0) - cached_hit)
                 provider.record_usage(
                     uncached_input,
@@ -7623,6 +7736,11 @@ Return one JSON object only:
                     "Examples: `!speak 你好`, `!speak wǒ ài nǐ`, `!speak how do you say thank you`"
                 )
                 return
+            if self.azure_tts_switched_off:
+                await message.channel.send(
+                    "🔇 Mandarin TTS is switched off for now (`AZURE_TTS_ENABLED=false` in `.env`)."
+                )
+                return
             if not (self.azure_tts_key and self.azure_tts_region):
                 await message.channel.send(
                     "❌ Mandarin TTS isn't configured. Set `AZURE_TTS_KEY` and `AZURE_TTS_REGION` "
@@ -7676,6 +7794,11 @@ Return one JSON object only:
                     "Speaks it in natural French (Azure fr-FR Denise) and shows the IPA "
                     "+ a liaison/pronunciation note.\n"
                     "Examples: `!french bonjour`, `!french les amis`, `!french how do you say I love you`"
+                )
+                return
+            if self.azure_tts_switched_off:
+                await message.channel.send(
+                    "🔇 French TTS is switched off for now (`AZURE_TTS_ENABLED=false` in `.env`)."
                 )
                 return
             if not (self.azure_tts_key and self.azure_tts_region):
