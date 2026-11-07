@@ -130,8 +130,14 @@ check("panel_members_all includes Kimi", '"GLM", "Kimi",' in src)
 check("_estimate_confidence has an override-only Kimi branch",
       'provider.name == "Kimi"' in inspect.getsource(bot.IsaicBot._estimate_confidence))
 shim_src = inspect.getsource(bot.IsaicBot._generate_openai_compatible_response)
-check("shim sends reasoning_effort when thinking + quirk set",
-      'api_kwargs["reasoning_effort"] = provider.think_reasoning_effort' in shim_src)
+# Structure check only — which tier is sent on which turn is covered
+# functionally by test_kimi_effort_tiers.py. K3 always thinks and defaults to
+# "max", so the shim must choose a tier per turn rather than send one only when
+# thinking is on (2026-11-07).
+check("shim picks a reasoning_effort tier per turn (plain vs thinking)",
+      "provider.think_reasoning_effort" in shim_src
+      and "provider.plain_reasoning_effort" in shim_src
+      and 'api_kwargs["reasoning_effort"]' in shim_src)
 check("identity prompt has a Kimi branch (Fireworks-served)",
       'made by Moonshot AI (served via Fireworks)' in src)
 

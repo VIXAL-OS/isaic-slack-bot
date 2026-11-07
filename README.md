@@ -15,7 +15,7 @@ The heads are skinned as the **twelve tribes** (the default `isaic` theme):
 
 | Head | Model | Summon with |
 |---|---|---|
-| **Judah** | Claude (Opus 5) | `!judah` / `!claude` |
+| **Judah** | Claude (Opus 5.5) | `!judah` / `!claude` |
 | **Joseph** | Gemini (3.1 Pro) | `!joseph` / `!gemini` |
 | **Zebulun** | Deepseek (V4.1 Flash) | `!zebulun` / `!deepseek` |
 | **Naphtali** | Mistral (Large 3) | `!naphtali` / `!mistral` |
@@ -116,3 +116,82 @@ its `fireworks` backend for US/ZDR (see `config.example.json`).
   semantics, deterministic human-to-human suppression, and a separately metered Haiku classifier.
 - ⚠️ **Owes a live Slack smoke test**: @-mention reply, thread continuity, 👍/👎 calibration, a file
   upload (LaTeX/TTS), and `!load`. Expect to fix small Slack-API edges once tokens are wired.
+
+## Prompt-cache ordering (2026-11-07)
+
+Mirrored from the Hydra Discord bot. Every head but Claude does **automatic prefix
+caching**, matched on the longest common prefix, so anything that churns between
+turns must sit downstream of everything stable — a change near the front of the
+prompt invalidates the cache for itself *and every token after it*, conversation
+history included.
+
+`_generate_response` was joining churning blocks into the system message ahead of
+the history, and `openai_messages.insert(0, ...)` puts that at the very head of the
+prompt. The memory context (changes whenever a `[note:]` lands) and the
+sparse-memory nudge (flips at the `<3` boundary) therefore re-billed the whole
+prompt at full input price. DeepSeek is $0.003/M cached vs $0.15/M miss (50×),
+Kimi $0.30/M vs $3/M (10×), Qwen $0.014/M cached.
+
+The prompt is now split: `stable_system` stays the cacheable prefix, and
+`volatile_context` is appended to the newest user turn by `_append_volatile_context`.
+One change at the assembly site covers every chat dispatch path, falling back to the
+old system-prompt placement when the newest turn is not a user message. The
+simulator deliberately keeps its volatile context in the preamble, since the tail of
+a sim prompt is transcript body. Claude gains an opt-in `cache_system` breakpoint
+(default on) because it caches only what carries `cache_control`; the panel and judge
+pass `cache_system=False`, since a one-shot prompt pays the cache-write premium and
+is never read back.
+
+Slack-specific note: `fetch_thread_index` is still a stub returning `""`, so ISAIC
+has none of the minute-granular thread-age churn the Discord bot had — only the
+memory block and the nudge. If that stub is ever implemented with relative ages, it
+already routes into `volatile_parts`, so it lands at the tail; just don't move it
+into the system message. The invariant is documented at the stub.
+
+Offline-validated with `scratchpad/test_prompt_cache_order.py` (31/31, run as
+`BOT_MODULE=isaic.core python scratchpad/test_prompt_cache_order.py`); the full
+pre-existing suite stays green. ⚠️ Owes a live Slack smoke test alongside the others.
+
+## Kimi reasoning-effort tiers (2026-11-07)
+
+Mirrored from Hydra. Moonshot's docs: the whole **K3 series always thinks** and
+takes a top-level `reasoning_effort` of `low` | `high` | `max`, **defaulting to
+`max`**. Our earlier note that K3 accepts only `"max"` was wrong. The consequence
+is that omitting the param on a plain turn does not mean "thinking off" — it means
+"thinking at max".
+
+`ModelProvider` gained `plain_reasoning_effort` alongside `think_reasoning_effort`,
+and the shim now picks a tier per turn rather than sending one only under `!think`.
+
+This bot's **default Kimi backend is Fireworks**, serving the open weights, which
+may not implement `reasoning_effort` at all — and a param the endpoint rejects
+fails the whole turn. So the plain tier is left `None` on the Fireworks default
+(a plain turn sends nothing, exactly as before) and set to `"low"` on the
+non-default `moonshot` backend, where the documented behavior applies. To enable
+it for Fireworks, smoke-test one plain and one `!think` Kimi turn, then add
+`plain_reasoning_effort="low"` to the default spec.
+
+Clearing a tier per backend required a new `_BACKEND_NULLABLE_FIELDS` list:
+`_apply_backend` skips a `None` override by default, so without it a backend would
+silently inherit the other route's tier. Both reasoning fields were also added to
+`_BACKEND_FIELD_MAP`.
+
+Offline-validated with `scratchpad/test_kimi_effort_tiers.py` (22/22, run as
+`BOT_MODULE=isaic.core python scratchpad/test_kimi_effort_tiers.py`). It resolves
+the Moonshot and Fireworks routes by `base_url`, so the one file covers both this
+bot and Hydra despite their inverted defaults.
+
+## Opus 5.5 migration (2026-10-05)
+
+The Claude Opus head now uses `claude-opus-5-5`: $4/M uncached input,
+$20/M output and $0.20/M cache reads. Five-minute cache writes cost $5/M;
+one-hour writes cost $8/M. Persisted historical cost estimates retain the old
+rates, while new calls accumulate dollars at their applicable rates.
+Thinking is adaptive; tool continuations preserve signed thinking blocks,
+the original system prompt and the full preceding conversation.
+Plain chat/search and summaries use low effort; explicit reasoning keeps
+its existing higher effort. Summaries select text blocks and reject empty or
+truncated results. Qwen remains on Fireworks at its existing backend rates.
+
+Sources: [migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide),
+[Opus pricing](https://www.anthropic.com/claude-opus-5-5).
