@@ -152,6 +152,35 @@ Offline-validated with `scratchpad/test_prompt_cache_order.py` (31/31, run as
 `BOT_MODULE=isaic.core python scratchpad/test_prompt_cache_order.py`); the full
 pre-existing suite stays green. ⚠️ Owes a live Slack smoke test alongside the others.
 
+## ⚠️ The 2026-11-07 work is OFFLINE-VALIDATED ONLY
+
+Everything dated 2026-11-07 below — the prompt-cache split and breakpoint, the
+Kimi reasoning-effort tiers, DeepSeek vision, the per-request tool-cost bucket —
+has **not been exercised against live Slack or a live provider from this repo.**
+It is published because the reasoning and the offline coverage are worth sharing,
+not because it has been run in anger here.
+
+What it does rest on:
+
+- **Offline harnesses pass** — 10 of them, including the cross-turn prefix
+  stability invariant driven through the real `_generate_response`, and the
+  per-request tool-cost accounting. Run any of them with
+  `BOT_MODULE=isaic.core python scratchpad/<name>.py`.
+- **The cache claim is live-proven in the sibling Discord bot**, which shares
+  this code: three real API calls there measured an 8,838-token prefix, read
+  8,760 of it back on a warm turn while the volatile tail churned on every axis,
+  and read **nothing** on a control call using the old prompt placement. That is
+  an API-level fact about prefix caching, so it carries across — but it was
+  measured there, not here.
+- **This bot has no live `config.json` in this checkout**, which is the honest
+  reason its Slack smoke tests have been outstanding: nothing has been wired up
+  to run.
+
+Still owed, and not blockable from here: an @-mention round trip, thread
+continuity, 👍/👎 calibration, a file upload, `!load`, and one `!cost` showing
+cache hits climbing across consecutive turns. Expect small Slack-API edges on
+first contact.
+
 ## Fleet parity: DeepSeek vision, tool-cost bucket, field-map fix (2026-11-07)
 
 Three things the Discord bot had and this one didn't, plus one correction.
