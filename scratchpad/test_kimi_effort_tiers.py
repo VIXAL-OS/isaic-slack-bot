@@ -75,10 +75,15 @@ check("one route is Moonshot and the other is not",
 
 print("\nthe Moonshot route carries both tiers")
 check("Moonshot thinking tier is max", moonshot_route.think_reasoning_effort == "max")
-check("Moonshot plain tier is low (NOT None — None would mean max)",
-      moonshot_route.plain_reasoning_effort == "low")
-check("the plain value is one the docs say K3 accepts",
-      moonshot_route.plain_reasoning_effort in ("low", "high", "max"))
+# WHICH tier a plain turn asks for is a per-bot product decision, not an
+# invariant: the Discord bot is a chat bot and wants "low", the Slack lab bot
+# wants "high". So pin that a tier IS set and that it is a value the docs say
+# K3 accepts — pinning the literal would just encode one bot's choice.
+PLAIN_TIER = moonshot_route.plain_reasoning_effort
+check("Moonshot plain tier is SET (None would silently mean max)",
+      PLAIN_TIER is not None)
+check(f"the plain value ({PLAIN_TIER!r}) is one the docs say K3 accepts",
+      PLAIN_TIER in ("low", "high", "max"))
 
 print("\nthe Fireworks route sends no plain tier (unverified there)")
 check("Fireworks plain tier is None",
@@ -144,8 +149,10 @@ def captured_kwargs(provider, thinking):
 
 
 kw = captured_kwargs(moonshot_route, thinking=False)
-check("plain Kimi turn on Moonshot sends reasoning_effort='low'",
-      kw.get("reasoning_effort") == "low")
+check(f"plain Kimi turn on Moonshot sends reasoning_effort={PLAIN_TIER!r}",
+      kw.get("reasoning_effort") == PLAIN_TIER)
+check("and that is NOT the thinking tier (the two tiers are distinct)",
+      kw.get("reasoning_effort") != moonshot_route.think_reasoning_effort)
 check("no extra_body {'thinking': ...} on it (K3 rejects that)",
       "thinking" not in (kw.get("extra_body") or {}))
 kw = captured_kwargs(moonshot_route, thinking=True)

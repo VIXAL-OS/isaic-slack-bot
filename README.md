@@ -152,6 +152,44 @@ Offline-validated with `scratchpad/test_prompt_cache_order.py` (31/31, run as
 `BOT_MODULE=isaic.core python scratchpad/test_prompt_cache_order.py`); the full
 pre-existing suite stays green. ⚠️ Owes a live Slack smoke test alongside the others.
 
+## Fleet parity: DeepSeek vision, tool-cost bucket, field-map fix (2026-11-07)
+
+Three things the Discord bot had and this one didn't, plus one correction.
+
+- **DeepSeek `supports_vision=True`.** Native multimodal since 2026-09-10 —
+  base64 / http(s) URL / Files API id, JPEG·PNG·GIF·WebP, an upper bound of
+  1024 tokens per image, ≤600 images and 48 MiB per request, user messages
+  only. No new wiring: `_convert_messages_to_openai_format` already emits
+  OpenAI `image_url` blocks. **Routing effect:** `vision_pool` now includes
+  Zebulun, so an image message is no longer forced to Claude or Gemini — at
+  $0.15/M against $4/M that is the cheap eye.
+- **Per-request tool cost bucket.** DeepSeek's Search & Fetch APIs bill $0.75
+  per 1,000 successful requests *each*, metered separately, live since
+  2026-10-31 16:00 UTC. `search_cost_per_1k_requests` /
+  `fetch_cost_per_1k_requests` (0.0 on every other head), counters, and
+  `record_tool_requests()` — deliberately **not** `record_usage`, because
+  request-priced spend must stay out of the token buckets and the per-token
+  energy/CO₂ estimate. Dollars are metered at record time so a rate change
+  never reprices history, and it bills even under `cost_mode="local"` (a
+  self-host pays nothing for inference, but Search/Fetch is hosted). Nothing
+  calls it yet — search runs on Tavily — so it exists to stop a future switch
+  under-reporting silently.
+- **`_BACKEND_FIELD_MAP` gained `max_context_tokens`**, closing a drift from
+  the Discord bot's September Qwen work. Without it a backend serving a
+  different-sized model couldn't declare its own context window.
+- **Correction: the Kimi plain tier is `high` here, not `low`.** The Discord
+  bot wants `low` on plain turns because it is a chat bot; copying that value
+  into the lab bot mirrored the wrong intent. Thoroughness is this bot's
+  product, so its `moonshot` backend asks for `high`. Note also what the
+  Fireworks default's `None` actually means — no param, so the provider's own
+  default applies, and on Moonshot's K3 that is `max`. "Unset" here is the most
+  thorough setting, not the least.
+
+Offline-validated: `scratchpad/test_tool_request_cost.py` (31) ported, and
+`test_kimi_effort_tiers.py` reworked to assert a tier is *set* and valid rather
+than pinning one bot's choice, so the one file now covers both repos (23 each).
+Full suite green.
+
 ## Kimi reasoning-effort tiers (2026-11-07)
 
 Mirrored from Hydra. Moonshot's docs: the whole **K3 series always thinks** and

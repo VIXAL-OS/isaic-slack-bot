@@ -360,6 +360,20 @@ class ModelProvider:
     peak_windows_utc: tuple = ()
     peak_multiplier: float = 1.0
 
+    # Server-side tool pricing, billed PER REQUEST rather than per token.
+    # DeepSeek's Search & Fetch APIs (/v1/tools/search, /v1/tools/fetch) bill
+    # $0.75 per 1,000 SUCCESSFUL requests each, metered separately, from
+    # 2026-10-31 16:00 UTC. A request counts only on HTTP 200 with a result (a
+    # non-empty `results` array for search, page content for fetch) — failures,
+    # empty results and timeouts are free — and `count` does not change the
+    # per-request price. These are flat: no peak multiplier applies.
+    # 0.0 (the default) means the provider has no such billing, so every other
+    # head is unaffected. Metered via record_tool_requests, NOT record_usage,
+    # because they are request-priced and must stay out of the token buckets
+    # and the energy/CO₂ estimate (which is per token).
+    search_cost_per_1k_requests: float = 0.0
+    fetch_cost_per_1k_requests: float = 0.0
+
     # Provider quirks for the OpenAI-compatible generator
     # ---------------------------------------------------
     # requires_reasoning_echo: When thinking mode is on, the provider's API
@@ -445,6 +459,13 @@ class ModelProvider:
     # This prevents a model upgrade from repricing lifetime token history.
     total_token_cost: Optional[float] = None
 
+    # Server-side tool requests (DeepSeek Search & Fetch), counted for display
+    # and metered into dollars AT RECORD TIME — same discipline as
+    # total_token_cost, so a later rate change never reprices history.
+    total_search_requests: int = 0
+    total_fetch_requests: int = 0
+    total_tool_request_cost: float = 0.0
+
     def is_peak(self, when: Optional[datetime] = None) -> bool:
         """True if `when` (default: now) falls in one of this provider's
         peak-pricing windows. Ignores public holidays (DeepSeek exempts
@@ -504,13 +525,52 @@ class ModelProvider:
                 (self._token_cost() - base_before) * (self.peak_multiplier - 1.0)
             )
 
+    def record_tool_requests(self, search: int = 0, fetch: int = 0) -> None:
+        """Record SUCCESSFUL server-side tool requests (DeepSeek Search/Fetch).
+
+        Separate from record_usage because these are priced per REQUEST, not
+        per token: they must not enter the token buckets (which would corrupt
+        $/token math) nor the energy estimate (which is per token). Pass only
+        requests that actually billed — HTTP 200 with a result. Dollars are
+        metered here, at the rates in force now, so a later price change never
+        reprices history.
+
+        Nothing calls this yet: search runs on Tavily and the bot never hits
+        /v1/tools/search or /v1/tools/fetch. It exists so that enabling
+        DeepSeek's native search is a two-line change that CANNOT silently
+        under-report in !cost — the same failure the 2026-09 cache-hit gap had,
+        where real spend simply wasn't counted.
+        """
+        if search:
+            self.total_search_requests += search
+            self.total_tool_request_cost += (
+                search / 1000.0 * self.search_cost_per_1k_requests
+            )
+        if fetch:
+            self.total_fetch_requests += fetch
+            self.total_tool_request_cost += (
+                fetch / 1000.0 * self.fetch_cost_per_1k_requests
+            )
+
+    def get_tool_request_cost(self) -> float:
+        """Dollars billed for per-request server-side tools.
+
+        NOT exempted by cost_mode="local": a self-hosted backend pays nothing
+        for inference, but Search/Fetch is a hosted DeepSeek service billed to
+        the account whatever runs the model. Zero unless such requests were
+        actually recorded, so a local provider still reports $0 overall.
+        """
+        return self.total_tool_request_cost
+
     def get_cost(self) -> float:
         """Get total cost for this provider across all pricing tiers and cache
-        states, including any peak-hour surcharge."""
+        states, including any peak-hour surcharge and per-request tool spend."""
         if self.cost_mode == "local":
-            return 0.0
+            # Tokens are free on a self-host, but hosted per-request tools are
+            # not — see get_tool_request_cost.
+            return self.get_tool_request_cost()
         token_cost = self._token_cost() if self.total_token_cost is None else self.total_token_cost
-        return token_cost + self.total_peak_surcharge
+        return token_cost + self.total_peak_surcharge + self.get_tool_request_cost()
 
     def _token_cost(self) -> float:
         """Recorded tokens priced at the base (off-peak) rates."""
@@ -595,6 +655,9 @@ class ModelProvider:
             "cache_storage_cost_est": self.total_cache_storage_cost_est,
             "peak_surcharge": self.total_peak_surcharge,
             "token_cost": self._token_cost() if self.total_token_cost is None else self.total_token_cost,
+            "search_requests": self.total_search_requests,
+            "fetch_requests": self.total_fetch_requests,
+            "tool_request_cost": self.total_tool_request_cost,
         }
 
     def load_stats(self, data: dict) -> None:
@@ -607,6 +670,10 @@ class ModelProvider:
         self.total_requests = data.get("requests", 0)
         self.total_cache_storage_cost_est = data.get("cache_storage_cost_est", 0.0)
         self.total_peak_surcharge = data.get("peak_surcharge", 0.0)
+        # Older saves predate per-request tool billing; 0 is the right history.
+        self.total_search_requests = data.get("search_requests", 0)
+        self.total_fetch_requests = data.get("fetch_requests", 0)
+        self.total_tool_request_cost = data.get("tool_request_cost", 0.0)
         self.total_token_cost = data.get("token_cost")
         if self.total_token_cost is None:
             if self.id == "claude":
@@ -714,10 +781,30 @@ DEEPSEEK_PROVIDER = ModelProvider(
     # US Eastern: Sun–Thu 9pm–midnight + weekday 2–6am.
     peak_windows_utc=(((0, 1, 2, 3, 4), 1, 4), ((0, 1, 2, 3, 4), 6, 10)),
     peak_multiplier=2.0,
+    # Search & Fetch server-side tools: $0.75 per 1,000 successful requests
+    # EACH, metered separately, live since 2026-10-31 16:00 UTC. Flat — the
+    # peak multiplier does not apply. We don't call them (search runs on
+    # Tavily), so these only matter if that changes; the rates are here so
+    # record_tool_requests prices them correctly on day one. Verified against
+    # api-docs.deepseek.com/guides/search, 2026-11-07.
+    search_cost_per_1k_requests=0.75,
+    fetch_cost_per_1k_requests=0.75,
     # 1M context per DeepSeek docs (max output 384k). Server-side
     # context caching is automatic — no client flags required.
     max_context_tokens=1_000_000,
-    supports_vision=False,
+    # NATIVE MULTIMODAL since 2026-09-10, enabled 2026-11-07 (Sarah's call,
+    # mirroring the Discord bot). api-docs.deepseek.com/guides/vision:
+    # `deepseek-flash` takes images as base64 data URL, http(s) URL or Files
+    # API id; JPEG/PNG/GIF/WebP; an upper bound of 1024 tokens per image; ≤600
+    # images and a 48 MiB body per request; images allowed ONLY in user
+    # messages. Wire format is already handled —
+    # _convert_messages_to_openai_format turns our Anthropic-style image
+    # blocks into OpenAI {"type":"image_url"} data URLs for every shim head.
+    # ROUTING EFFECT: `vision_pool` in _select_model now includes Zebulun, so
+    # an image message is no longer forced to Claude/Gemini — at $0.15/M
+    # against $4/M that is the cheap eye, and the 1024-token cap per image
+    # keeps looking cheap.
+    supports_vision=True,
     supports_web_search=False,
     # Deepseek V4 enables thinking by default and requires reasoning_content
     # to be echoed back on every prior assistant turn when thinking is on.
@@ -966,9 +1053,14 @@ KIMI_PROVIDER = ModelProvider(
     # Fireworks serving the open weights, which may not implement the param at
     # all, so `plain_reasoning_effort` is deliberately left None here: a plain
     # turn sends nothing, exactly as before this change. The tier is set on the
-    # "moonshot" backend below, where the docs apply. To enable it for
-    # Fireworks, smoke-test one plain and one !think Kimi turn, then add
-    # plain_reasoning_effort="low" here.
+    # "moonshot" backend below, where the docs apply.
+    # Note what "sends nothing" means, because it is NOT laziness: with no
+    # param, the provider's own default applies, and on Moonshot's K3 that
+    # default is "max" — the most thorough setting, not the least. Hydra is the
+    # bot that needed turning DOWN; a lab bot does not.
+    # To enable it for Fireworks, smoke-test one plain and one !think Kimi turn
+    # there; if the param is accepted, set plain_reasoning_effort="high" (the
+    # lab tier — see the moonshot backend below), not "low".
     think_reasoning_effort="max",
     est_wh_per_1k_tokens=0.5,   # VERIFY — huge total params but sparse (~50B active) + KDA decode wins
     grid_gco2_per_kwh=400.0,    # Fireworks US fleet
@@ -987,10 +1079,15 @@ KIMI_PROVIDER = ModelProvider(
             "grid_gco2_per_kwh": 550.0,   # Moonshot China API (east-CN grid)
             "supports_server_cache": True,
             # Moonshot's own K3 is where "always thinks, defaults to max" is
-            # documented, so the plain tier belongs here: without it a plain
-            # turn bills at MAX reasoning. Only reachable if someone enables
-            # this backend, which the lab egress rule says not to do.
-            "plain_reasoning_effort": "low",
+            # documented, so the plain tier belongs here.
+            # "high", NOT the Discord bot's "low": that one is a chat bot where
+            # a plain turn doesn't need deep reasoning, and copying its value
+            # here was a mechanical mirror of the wrong intent. This is the LAB
+            # bot — thoroughness is the product, so a plain turn asks for high
+            # and only the cost-capping extreme (max) is declined. Only
+            # reachable if someone enables this backend, which the lab egress
+            # rule says not to do.
+            "plain_reasoning_effort": "high",
         },
     },
 )
@@ -1167,6 +1264,11 @@ _BACKEND_FIELD_MAP = {
     "supports_server_cache": "supports_server_cache",
     "cost_mode": "cost_mode",
     "peak_windows_utc": "peak_windows_utc",  # () = flat-priced backend
+    # A backend may serve a different-sized model than the default spec, so it
+    # has to be able to override the context window (added 2026-11-07 to close
+    # a drift from the Discord bot, which gained this in the Sep Qwen work —
+    # without it, e.g. Kimi's Fireworks route could not declare its own 1040k).
+    "max_context_tokens": "max_context_tokens",
     # Reasoning-effort tiers are per-BACKEND: the same open weights served
     # elsewhere need not implement the vendor's reasoning_effort param at all,
     # and sending one it rejects fails the whole turn.
@@ -2339,6 +2441,21 @@ class ConversationManager:
                         if p.cost_mode == "local" else f"${cost:.4f}")
             if p.cost_mode != "local" and p.total_peak_surcharge > 0:
                 cost_str += f" (incl. ${p.total_peak_surcharge:.4f} peak-hour surcharge)"
+            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
+            # per CALL, not per token, so they get their own clause rather than
+            # hiding inside a $/token figure. On a local backend this is the
+            # only real spend, so it shows there too.
+            tool_calls = p.total_search_requests + p.total_fetch_requests
+            if tool_calls > 0:
+                tool_bits = []
+                if p.total_search_requests:
+                    tool_bits.append(f"{p.total_search_requests:,} search")
+                if p.total_fetch_requests:
+                    tool_bits.append(f"{p.total_fetch_requests:,} fetch")
+                cost_str += (
+                    f" (incl. ${p.get_tool_request_cost():.4f} for "
+                    f"{' + '.join(tool_bits)} tool calls)"
+                )
             lines.append(
                 f"  **{p.name}**: {p.total_requests} requests, "
                 f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
