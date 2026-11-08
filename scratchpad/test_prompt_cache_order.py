@@ -233,9 +233,18 @@ check("cache_system=False + fic → system block NOT cached",
 
 print("\npanel/judge opt out of the system cache write")
 import inspect  # noqa: E402
+# _panel_complete became a thin selection-attribution wrapper on 2026-11-07,
+# so the body to inspect lives in _panel_complete_dispatch where that exists.
+# Read BOTH rather than only the wrapper: a future refactor that leaves a
+# wrapper behind must fail here, not pass on an empty search.
 panel_src = inspect.getsource(BotClass._panel_complete)
+_dispatch = getattr(BotClass, "_panel_complete_dispatch", None)
+if _dispatch is not None:
+    panel_src += inspect.getsource(_dispatch)
 check("_panel_complete passes cache_system=False on the Claude path",
       "cache_system=False" in panel_src)
+check("and the cache-WRITE premium is named as the reason at the call",
+      "cache" in panel_src.lower() and "write" in panel_src.lower())
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

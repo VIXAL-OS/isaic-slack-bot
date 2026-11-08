@@ -348,3 +348,29 @@ truncated results. Qwen remains on Fireworks at its existing backend rates.
 
 Sources: [migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide),
 [Opus pricing](https://www.anthropic.com/claude-opus-5-5).
+
+## `!cost` parity with the Discord bot (2026-11-08)
+
+The whole cost/carbon stack was ported from Hydra: two side-by-side rankings (cost AND CO2e, which
+order the fleet **differently**), everyday carbon equivalents, the volume-free `Per Mtok` line and
+its dual `Per $`, routing attribution (`Chosen by: auto / yours / machinery`), `cost_mode="plan"`
+for prepaid subscriptions, and a new **`!costdetail`** command (aliases `!breakdown`, `!detail`,
+optional single head) carrying the exact per-provider numbers that no longer fit beside the
+rankings.
+
+Three things differ from the Discord original, all forced by mrkdwn:
+
+- **A lone `~` is strikethrough in Slack** (Discord needs `~~`), so every "approximately" in the
+  output is `≈`. An odd number of tildes silently strikes out everything between them —
+  the same failure as a bare `_` opening an italic run, which is why `AMORTIZE_TRAINING=0` sits in
+  a code span. **Anything new that prints an identifier or an approximation needs the same care.**
+- **`**bold**` is written, not `*bold*`**: `formatting.md_to_mrkdwn` converts on send, so the
+  summary is authored in the same Markdown as Hydra's and converted once.
+- **The 1,990-char budget is kept even though Slack chunks** rather than rejecting an over-length
+  message, because a chunk boundary inside the fenced ranking table would render everything after
+  it as code.
+
+Offline-validated with `BOT_MODULE=isaic.core python scratchpad/test_cost_summary_format.py`
+(90/90, including the tilde rule and an end-to-end pass through the real converter) and
+`scratchpad/test_selection_attribution.py` (35/35). As everywhere else in this checkout, no live
+Slack round-trip has run.

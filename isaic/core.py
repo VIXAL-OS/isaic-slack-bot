@@ -30,6 +30,7 @@ from functools import partial
 import json
 import os
 import asyncio
+import contextvars
 import aiohttp
 import base64
 import re
@@ -337,7 +338,21 @@ class ModelProvider:
     # cost_mode="local" skips per-token $ and labels the turn electricity-only
     # (tokens are still counted, so energy/CO₂ still report).
     supports_server_cache: bool = True
-    cost_mode: str = "metered"           # "metered" | "local"
+    #   "metered" - pay per token at the rates above (every head today).
+    #   "local"   - self-hosted: no per-token $, labelled electricity-only.
+    #   "plan"    - a prepaid subscription (e.g. Alibaba Model Studio's Token
+    #               Plan). Usage draws down an allowance bought up front, so a
+    #               per-token $ figure would double-count against the flat
+    #               fee; tokens, energy and CO2 still report exactly, because
+    #               get_energy_wh / get_co2_g never consult cost_mode. That is
+    #               the whole trick that makes a prepaid plan safe to model.
+    #               No credits counter on purpose: the endpoint returns tokens,
+    #               not Credits, and the ratio is the vendor's to define.
+    cost_mode: str = "metered"           # "metered" | "local" | "plan"
+    # Flat monthly fee for cost_mode="plan"; surfaced as its own !cost line
+    # rather than folded into usage, because it is owed whether or not a single
+    # token is sent.
+    plan_monthly_usd: float = 0.0
     # Routing metadata target (spec §4.1). INERT this phase — routing stays in
     # _estimate_confidence; never consulted by _select_model yet. Groundwork
     # for a future config-driven router.
@@ -515,6 +530,15 @@ class ModelProvider:
     total_fetch_requests: int = 0
     total_tool_request_cost: float = 0.0
 
+    # Tokens billed, split by who chose this provider for the turn (see
+    # _SELECTION_MODE). Keyed by mode; absent keys mean zero. Deliberately
+    # TOKENS and not requests: requests are bumped at the call sites, where one
+    # logical request can call record_usage several times (tool loop, degraded
+    # retry), whereas tokens are what both dollars and carbon follow. Sums to
+    # LESS than the token totals on any save that predates this counter -- the
+    # remainder is reported as unattributed rather than guessed at.
+    total_tokens_by_selection: dict = field(default_factory=dict)
+
     def is_peak(self, when: Optional[datetime] = None) -> bool:
         """True if `when` (default: now) falls in one of this provider's
         peak-pricing windows. Ignores public holidays (DeepSeek exempts
@@ -567,6 +591,17 @@ class ModelProvider:
             self.total_output_tokens += output_tokens
             self.total_cached_input_tokens += cached_input_tokens
         self.total_token_cost += self._token_cost() - base_before
+        # Attribute this call's tokens to whoever chose this provider. Reading
+        # the ContextVar here (rather than taking a parameter) is what keeps
+        # all 11 call sites untouched; an unrecognised value is treated as
+        # machinery rather than trusted.
+        mode = _SELECTION_MODE.get()
+        if mode not in SELECTION_MODES:
+            mode = "system"
+        self.total_tokens_by_selection[mode] = (
+            self.total_tokens_by_selection.get(mode, 0)
+            + input_tokens + cached_input_tokens + output_tokens
+        )
         if peak:
             # This request's base-rate cost is the delta it just added; bill the
             # rest of the peak price on top as a surcharge.
@@ -614,7 +649,7 @@ class ModelProvider:
     def get_cost(self) -> float:
         """Get total cost for this provider across all pricing tiers and cache
         states, including any peak-hour surcharge and per-request tool spend."""
-        if self.cost_mode == "local":
+        if self.cost_mode in ("local", "plan"):
             # Tokens are free on a self-host, but hosted per-request tools are
             # not — see get_tool_request_cost.
             return self.get_tool_request_cost()
@@ -627,7 +662,7 @@ class ModelProvider:
         # is no $ figure to report. Tokens are still counted, so get_energy_wh /
         # get_co2_g still surface the carbon. See cost_mode + the "local" label
         # in ConversationManager.get_cost_summary.
-        if self.cost_mode == "local":
+        if self.cost_mode in ("local", "plan"):
             return 0.0
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
@@ -707,6 +742,7 @@ class ModelProvider:
             "search_requests": self.total_search_requests,
             "fetch_requests": self.total_fetch_requests,
             "tool_request_cost": self.total_tool_request_cost,
+            "tokens_by_selection": dict(self.total_tokens_by_selection),
         }
 
     def load_stats(self, data: dict) -> None:
@@ -723,6 +759,11 @@ class ModelProvider:
         self.total_search_requests = data.get("search_requests", 0)
         self.total_fetch_requests = data.get("fetch_requests", 0)
         self.total_tool_request_cost = data.get("tool_request_cost", 0.0)
+        # Saves predating this counter carry no attribution. An empty dict
+        # is the honest history: those tokens are unattributed, not
+        # auto-routed.
+        self.total_tokens_by_selection = dict(
+            data.get("tokens_by_selection") or {})
         self.total_token_cost = data.get("token_cost")
         if self.total_token_cost is None:
             if self.id == "claude":
@@ -770,6 +811,29 @@ class SearchResult:
 # precise footprint, and we never route on it.
 GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
 
+# Who chose the model for the turn currently being billed. Read by
+# ModelProvider.record_usage so !cost can answer a question the cumulative
+# figures cannot: was this spend the ROUTER's decision or yours? A cheap head
+# that auto-routing picks constantly dominates the CO2e column without anyone
+# ever having chosen it, and that is a routing problem; the same volume chosen
+# deliberately is not.
+#
+# A ContextVar, not a threaded parameter: record_usage has 11 call sites across
+# five dispatch paths (and the tool loop calls it repeatedly inside one logical
+# request), so threading would touch all of them, while asyncio gives each
+# Slack event its own Task -- and a child Task gets a COPY of the context --
+# so this is exact under concurrent turns at zero churn at those sites.
+#
+# Default "system": anything that is not a user-facing model choice -- panel
+# members, the judge, bookclub recaps, !summarize, G2P, the participation
+# classifier -- bills there without having to opt in. Only the chat path sets
+# one of the other two, and only _panel_complete has to force "system" back,
+# because it is reached from inside a chat turn that already set its own.
+SELECTION_MODES = ("auto", "override", "system")
+SELECTION_LABELS = {"auto": "auto", "override": "yours", "system": "machinery"}
+_SELECTION_MODE = contextvars.ContextVar("isaic_selection_mode",
+                                         default="system")
+
 # Amortization horizon for embodied TRAINING carbon (see ModelProvider.train_
 # tco2e). The dominant unknown — a frontier model serves ~10^13–10^15 tokens
 # over its ~1–2-yr life. Default 1e14 (~100T) is calibrated so Mistral's public
@@ -777,6 +841,74 @@ GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
 # with MODEL_LIFETIME_TOKENS in .env; AMORTIZE_TRAINING=0 hides the line.
 MODEL_LIFETIME_TOKENS = float(os.getenv("MODEL_LIFETIME_TOKENS", "1e14"))
 AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "False", "")
+
+# Everyday equivalents for the !cost carbon line. A number like "7,199 g CO₂e"
+# means nothing to most people; "18 miles of driving" is a quantity you have
+# intuitions about. These are ORDER-OF-MAGNITUDE anchors on an estimate that is
+# itself order-of-magnitude, so they inherit all of its error — they exist to
+# make the figure legible, never to make a claim.
+#   - Car: the US EPA's average passenger vehicle is ~400 g CO₂/mile tailpipe.
+#     Kept in the EPA's own per-MILE unit rather than converted to g/km, so
+#     the constant IS the source figure and the line reads in the unit the
+#     people running this bot drive in. Tailpipe only; fuel production and the
+#     car's own manufacture would push it higher, so this UNDERSTATES driving
+#     and is therefore the conservative direction for a comparison that
+#     flatters us. (Only the car is imperial — energy stays kWh and mass kg.)
+#   - Gaming: a mid-range gaming PC under load draws roughly 400 W, and the
+#     IPCC AR5 lifecycle median for coal power is ~820 g CO₂e/kWh — so ~328 g
+#     per hour on a coal-heavy grid. Chosen because it is a recognisable
+#     "screen doing compute" baseline to compare screen-doing-compute against.
+CO2_G_PER_MILE_GAS_CAR = float(os.getenv("CO2_G_PER_MILE_GAS_CAR", "400"))
+GAMING_PC_WATTS = float(os.getenv("GAMING_PC_WATTS", "400"))
+COAL_GRID_GCO2_PER_KWH = float(os.getenv("COAL_GRID_GCO2_PER_KWH", "820"))
+
+
+def _compact_tokens(n: int) -> str:
+    """Token count in as few characters as possible: 56.1M, 812k, 403."""
+    if n >= 1_000_000:
+        return "{:.1f}M".format(n / 1_000_000)
+    if n >= 1_000:
+        return "{:.0f}k".format(n / 1_000)
+    return str(n)
+
+
+def _mass_co2(g: float) -> str:
+    """Render a CO2e mass for display: kg above a kilo, grams below.
+
+    Module-level because !cost and !costdetail must format the same mass
+    identically -- a figure that reads "<1 g" in one place and "0 g" in the
+    other invites the reader to think the two disagree.
+    """
+    if g >= 1000:
+        return "{:,.1f} kg".format(g / 1000)
+    # "0 g" reads as "none"; "<1 g" reads as "negligible", which is what a
+    # sub-gram figure actually means.
+    return "{:,.0f} g".format(g) if g >= 0.5 else "<1 g"
+
+
+def _co2_equivalents(co2_g: float) -> str:
+    """Render a CO₂e mass as everyday equivalents, or '' if too small to bother.
+
+    Deliberately two anchors, not five: a list of comparisons reads as
+    precision the underlying estimate does not have.
+    """
+    if co2_g < 1.0:
+        return ""
+    miles = co2_g / CO2_G_PER_MILE_GAS_CAR
+    gaming_h = co2_g / (GAMING_PC_WATTS / 1000.0 * COAL_GRID_GCO2_PER_KWH)
+    # Sub-mile masses read in feet rather than as a decimal fraction of a
+    # mile: "0.4 miles" invites precision this estimate cannot carry.
+    if miles >= 1:
+        car = "1 mile" if round(miles) == 1 else f"{miles:,.0f} miles"
+    else:
+        car = f"{miles * 5280:,.0f} ft"
+    if gaming_h >= 1:
+        game = f"{gaming_h:,.0f} h"
+    else:
+        game = f"{gaming_h * 60:,.0f} min"
+    return (f"about the same as driving {car} in an average gasoline car, "
+            f"or {game} of PC gaming on a coal-heavy grid")
+
 
 # Alternation of model display-names (provider.name values) that can show up as
 # echoed "[Name]" labels in model output. The response pipeline strips any of
@@ -1330,6 +1462,7 @@ _BACKEND_FIELD_MAP = {
     "grid_gco2_per_kwh": "grid_gco2_per_kwh",
     "supports_server_cache": "supports_server_cache",
     "cost_mode": "cost_mode",
+    "plan_monthly_usd": "plan_monthly_usd",
     "peak_windows_utc": "peak_windows_utc",  # () = flat-priced backend
     # A backend may serve a different-sized model than the default spec, so it
     # has to be able to override the context window (added 2026-11-07 to close
@@ -1435,6 +1568,30 @@ class ProviderRegistry:
             prov.model_id = pcfg["model"]
         if "routing_tags" in pcfg:
             prov.routing_tags = list(pcfg["routing_tags"])
+        # "plan" when this provider's usage is prepaid, so !cost stops
+        # reporting a per-token $ that would double-count against the flat fee.
+        # Token, energy and CO2 accounting are untouched by this -- the point.
+        # e.g. providers.qwen = {"cost_mode": "plan", "plan_monthly_usd": 3}
+        if "cost_mode" in pcfg:
+            mode = pcfg["cost_mode"]
+            if mode in ("metered", "local", "plan"):
+                prov.cost_mode = mode
+            else:
+                print(f"\u26a0\ufe0f  {prov.name}: ignoring unknown "
+                      f"cost_mode={mode!r} (known: metered, local, plan) "
+                      f"\u2014 keeping {prov.cost_mode!r}.")
+        if "plan_monthly_usd" in pcfg:
+            try:
+                prov.plan_monthly_usd = float(pcfg["plan_monthly_usd"])
+            except (TypeError, ValueError):
+                print(f"\u26a0\ufe0f  {prov.name}: plan_monthly_usd="
+                      f"{pcfg['plan_monthly_usd']!r} is not a number \u2014 "
+                      f"ignoring (the !cost plan line will omit the fee).")
+            else:
+                if prov.cost_mode != "plan":
+                    print(f"\u26a0\ufe0f  {prov.name}: plan_monthly_usd is "
+                          f"set but cost_mode is {prov.cost_mode!r}, so the "
+                          f"fee will not show. Set cost_mode='plan' too.")
         # Simulator mode (Phase 7) + the endpoint knobs an operator needs to
         # point the Dummy Plug at their own /completions box. These are additive
         # and only fire when present in config, so the default config (and the 6
@@ -1538,6 +1695,10 @@ class ProviderRegistry:
                 extra += f"; backend={prov.backend}"
             if prov.cost_mode == "local":
                 extra += "; local (no per-token $)"
+            elif prov.cost_mode == "plan":
+                fee = (f" ${prov.plan_monthly_usd:.2f}/mo"
+                       if prov.plan_monthly_usd else "")
+                extra += f"; prepaid plan{fee} (no per-token $)"
             if prov.completions_mode:
                 extra += f"; simulator/base @ {prov.base_url}"
             print(f"🟢 {prov.name} enabled (model: {prov.model_id}{extra})")
@@ -2467,21 +2628,20 @@ class ConversationManager:
             f"~{est_tokens:,} tokens (~${est_cost:.3f} worst-case){material_note}"
         )
     
-    def get_cost_summary(self, providers: list[ModelProvider]) -> str:
-        """Get total cost summary across all models, including cache hit rate."""
-        lines = ["💰 **Cost Summary**"]
-        grand_total = 0.0
-        storage_total = 0.0
-        energy_wh_total = 0.0
-        co2_g_total = 0.0
-        train_co2_g_total = 0.0
+    def _cost_rows(self, providers: list[ModelProvider]) -> tuple[list[dict], float]:
+        """Per-provider cost/carbon rows, plus live Gemini cache storage.
 
+        Shared by !cost and !costdetail so the two can never disagree
+        about what was billed: the rankings and the exact per-provider
+        numbers are built from the same rows, in-flight storage included.
+        """
+        now = _utcnow()
         # Live (in-flight) Gemini cache storage. total_cache_storage_cost_est
         # holds only SETTLED storage from caches already torn down; add what
-        # currently-alive caches have accrued so far (created_at → now, capped at
-        # expiry) so the figure tracks the real, growing bill instead of the
-        # stale creation-time guess that used to read cheap while the balance bled.
-        now = _utcnow()
+        # currently-alive caches have accrued so far (created_at -> now, capped
+        # at expiry) so the figure tracks the real, growing bill instead of the
+        # stale creation-time guess that used to read cheap while the balance
+        # bled.
         gemini_live_storage = 0.0
         for mat in self.reading_materials.values():
             for k, created in mat.cache_created_at.items():
@@ -2491,108 +2651,344 @@ class ConversationManager:
                         mat.cache_expires_at.get(k), now,
                     )
 
+        rows = []
         for p in providers:
             storage_est = p.total_cache_storage_cost_est
             if p.name == "Gemini":
                 storage_est += gemini_live_storage
             if p.total_requests == 0 and storage_est == 0.0:
                 continue
-            cost = p.get_cost()
-            grand_total += cost
-            storage_total += storage_est
-            energy_wh = p.get_energy_wh()
-            energy_wh_total += energy_wh
-            co2_g = p.get_co2_g(GRID_GCO2_PER_KWH)
-            co2_g_total += co2_g
-            train_co2_g_total += p.get_amortized_train_co2_g(MODEL_LIFETIME_TOKENS)
-
-            # Sum uncached + cached across both pricing tiers
             uncached_in = p.total_input_tokens + p.total_input_tokens_above_tier
-            cached_in = p.total_cached_input_tokens + p.total_cached_input_tokens_above_tier
-            out_tokens = p.total_output_tokens + p.total_output_tokens_above_tier
-            total_in = uncached_in + cached_in
+            cached_in = (p.total_cached_input_tokens
+                         + p.total_cached_input_tokens_above_tier)
+            rows.append({
+                "p": p,
+                "cost": p.get_cost(),
+                "storage": storage_est,
+                "energy": p.get_energy_wh(),
+                "co2": p.get_co2_g(GRID_GCO2_PER_KWH),
+                "train": p.get_amortized_train_co2_g(MODEL_LIFETIME_TOKENS),
+                "in": uncached_in,
+                "cached": cached_in,
+                "out": p.total_output_tokens + p.total_output_tokens_above_tier,
+                # Volume-INDEPENDENT carbon intensity: g CO2e per million
+                # tokens. est_wh_per_1k_tokens is Wh/1k tokens, which is
+                # numerically also kWh per Mtok, so this is just Wh x grid.
+                # A property of model+endpoint, unlike the cumulative figure.
+                "intensity": p.est_wh_per_1k_tokens * (
+                    p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
+                    else GRID_GCO2_PER_KWH),
+            })
+        # g CO2e per dollar of TOKENS -- "if I spend a dollar here, how much
+        # waste do I make for it?" The dual of "intensity": that one is the
+        # metric when the work is fixed and you want the least emissions per
+        # unit of work, this one when the BUDGET is fixed and you want the
+        # least emissions per unit of spend. They rank differently because a
+        # dollar buys wildly different token counts -- a cheap head on a dirty
+        # grid is the worst thing you can spend a dollar on even while being
+        # the cleanest thing you can send a token to.
+        #
+        # REALISED, not rate-card: cost and co2 are both what actually
+        # happened, so cache hits and peak surcharges are already baked in
+        # (an 89% hit rate makes a dollar buy more tokens, hence more waste).
+        # Cache STORAGE is deliberately excluded from the denominator -- those
+        # dollars bought no tokens, so counting them would flatter the
+        # provider that leaks storage. None where there is no per-token price
+        # (cost_mode "local"/"plan", or simply nothing billed yet): the ratio
+        # is undefined there, not zero.
+        for r in rows:
+            r["per_dollar"] = (r["co2"] / r["cost"]) if r["cost"] > 0 else None
+        return rows, gemini_live_storage
 
-            # Hit rate on input tokens (% served from cache)
-            hit_rate = (cached_in / total_in * 100) if total_in > 0 else 0.0
-            cache_note = ""
-            if cached_in > 0:
-                cache_note = f", 🟢 {cached_in:,} cached ({hit_rate:.0f}% hit rate)"
+    def get_cost_summary(self, providers: list[ModelProvider]) -> str:
+        """Cost + carbon summary, ranked, with everyday carbon equivalents.
 
-            # Self-hosted / local backends bill electricity, not per token — show
-            # that instead of a $0.0000 that reads like "free". The 🌱 energy
-            # line below still reports (tokens are counted) on the self-host grid.
-            cost_str = ("local (no per-token $ — electricity only)"
-                        if p.cost_mode == "local" else f"${cost:.4f}")
-            if p.cost_mode != "local" and p.total_peak_surcharge > 0:
-                cost_str += f" (incl. ${p.total_peak_surcharge:.4f} peak-hour surcharge)"
-            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
-            # per CALL, not per token, so they get their own clause rather than
-            # hiding inside a $/token figure. On a local backend this is the
-            # only real spend, so it shows there too.
-            tool_calls = p.total_search_requests + p.total_fetch_requests
-            if tool_calls > 0:
-                tool_bits = []
-                if p.total_search_requests:
-                    tool_bits.append(f"{p.total_search_requests:,} search")
-                if p.total_fetch_requests:
-                    tool_bits.append(f"{p.total_fetch_requests:,} fetch")
-                cost_str += (
-                    f" (incl. ${p.get_tool_request_cost():.4f} for "
-                    f"{' + '.join(tool_bits)} tool calls)"
-                )
-            lines.append(
-                f"  **{p.name}**: {p.total_requests} requests, "
-                f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
-                f"{cost_str}"
-            )
-            if storage_est > 0:
-                live_note = (
-                    f", ${gemini_live_storage:.4f} still accruing on a live cache"
-                    if p.name == "Gemini" and gemini_live_storage > 0 else ""
-                )
-                lines.append(
-                    f"      ⏳ + ~${storage_est:.4f} Gemini cache storage "
-                    f"(time-based, per token-hour{live_note})"
-                )
-            if energy_wh > 0:
-                grid = p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None else GRID_GCO2_PER_KWH
-                lines.append(
-                    f"      🌱 ≈ {energy_wh:.1f} Wh ≈ {co2_g:.0f} g CO₂e "
-                    f"(grid ≈ {grid:.0f} g/kWh)"
-                )
+        The layout is deliberate. The old format listed providers in registry
+        order with three lines each, which buried the one genuinely surprising
+        fact: cost and carbon rank DIFFERENTLY. A cheap head on a dirty grid
+        can be 3% of the bill and 80% of the emissions, and a registry-ordered
+        list hides that completely. So the two rankings lead, side by side,
+        and the per-provider detail follows for when exact numbers are wanted.
+        """
+        rows, gemini_live_storage = self._cost_rows(providers)
+
+        grand_total = sum(r["cost"] for r in rows)
+        storage_total = sum(r["storage"] for r in rows)
+        energy_wh_total = sum(r["energy"] for r in rows)
+        co2_g_total = sum(r["co2"] for r in rows)
+        train_co2_g_total = sum(r["train"] for r in rows)
 
         # energy_wh_total guards the local/self-hosted case: those bill $0 per
         # token but still record tokens, so a non-zero energy total means real
         # traffic happened even when grand_total is $0.
         if grand_total == 0 and storage_total == 0 and energy_wh_total == 0:
-            return "💰 No API calls made yet."
+            return "\U0001F4B0 No API calls made yet."
+
+        def money(v):
+            """2dp in the rankings so they stay scannable; the detail block
+            below carries full precision for anything this rounds away."""
+            if v >= 0.01:
+                return "${:,.2f}".format(v)
+            return "<$0.01" if v > 0 else "$0.00"
+
+        mass = _mass_co2
+
+        def share(part, whole):
+            if not whole:
+                return "  - "
+            pct = part / whole * 100
+            return "<1%" if 0 < pct < 0.5 else "{:.0f}%".format(pct)
+
+        spend_total = grand_total + storage_total
+        by_cost = sorted(rows, key=lambda r: r["cost"] + r["storage"],
+                         reverse=True)
+        by_co2 = sorted(rows, key=lambda r: r["co2"], reverse=True)
+
+        lines = ["\U0001F4B0 **Cost Summary**", "```"]
+        def short(name):
+            """Fit a provider name to the column.
+
+            provider.name is the canonical ROUTING key and must never be
+            renamed (see CLAUDE.md), but it is not written for a 9-character
+            field: "Haiku participation gate" overflowed it on the first live
+            8-provider summary, pushing the right-hand column out and welding
+            the row number onto the previous share ("<1%8 Mistral"). The table
+            only works while every row is the same width, so display truncates
+            and the canonical name stays untouched.
+            """
+            return name if len(name) <= 9 else name[:8] + "\u2026"
+
+        def fit_list(prefix, items, suffix="", budget=330):
+            """Join a ranked list, keeping whole entries up to a budget.
+
+            These two lines carry EVERY provider at full name length, so they
+            are the part of the summary that grows fastest with the fleet.
+            They are ordered by the metric, so the entries worth reading are
+            at the front and the rest become a count -- never a mid-word cut.
+            """
+            kept = []
+            used = len(prefix) + len(suffix)
+            for n, item in enumerate(items):
+                extra = len(item) + (3 if kept else 0)
+                if kept and used + extra > budget:
+                    return (prefix + " \u00b7 ".join(kept) + suffix
+                            + " \u00b7 +{} more".format(len(items) - n))
+                kept.append(item)
+                used += extra
+            return prefix + " \u00b7 ".join(kept) + suffix
+
+        lines.append("{:<26}{}".format("by cost", "by CO2e"))
+        for i in range(len(rows)):
+            c, e = by_cost[i], by_co2[i]
+            c_v = c["cost"] + c["storage"]
+            left = "{} {:<9}{:>9}{:>5}".format(
+                i + 1, short(c["p"].name), money(c_v),
+                share(c_v, spend_total))
+            right = "{} {:<9}{:>9}{:>5}".format(
+                i + 1, short(e["p"].name), mass(e["co2"]),
+                share(e["co2"], co2_g_total))
+            lines.append("{:<26}{}".format(left, right))
+        lines.append("```")
 
         if storage_total > 0:
             lines.append(
-                f"\n  **Total**: ${grand_total:.4f} tokens "
-                f"+ ~${storage_total:.4f} cache storage (est) "
-                f"= **~${grand_total + storage_total:.4f}**"
-            )
+                "**Total**: ${:.4f} tokens + \u2248${:.4f} cache storage (est) "
+                "= **\u2248${:.4f}**".format(grand_total, storage_total, spend_total))
         else:
-            lines.append(f"\n  **Total**: ${grand_total:.4f}")
+            lines.append("**Total**: ${:.4f}".format(grand_total))
+
+        # Prepaid-plan fees are flat monthly commitments, not usage, so they sit
+        # BELOW the usage total rather than inside it — the total has to stay a
+        # figure that only moves when the bot actually spends.
+        plan_rows = [r for r in rows
+                     if r["p"].cost_mode == "plan" and r["p"].plan_monthly_usd]
+        if plan_rows:
+            fees = sum(r["p"].plan_monthly_usd for r in plan_rows)
+            names = ", ".join(r["p"].name for r in plan_rows)
+            lines.append(
+                "**+ prepaid plans**: ${:.2f}/mo flat ({}) — owed whether or "
+                "not a token is sent, so it is not in the usage total "
+                "above.".format(fees, names))
+
         if energy_wh_total > 0:
+            equiv = _co2_equivalents(co2_g_total)
             lines.append(
-                f"  **Energy (est)**: ≈ {energy_wh_total:.1f} Wh ≈ {co2_g_total:.0f} g CO₂e — "
-                f"order-of-magnitude only; per-provider grid intensity, non-reasoning baseline "
-                f"(tune Wh/grid in code/.env)."
-            )
+                "\U0001F331 **\u2248 {:,.1f} kWh \u2248 {} CO2e**".format(
+                    energy_wh_total / 1000.0, mass(co2_g_total))
+                + (" — {}.".format(equiv) if equiv else ""))
+            # The ranking above is volume x intensity, and volume is a
+            # routing/override artifact, not a property of a model: a cheap
+            # head that auto-routing picks constantly will top the CO2e column
+            # while being the CLEANEST thing in the fleet per token. Both
+            # facts are real and they answer different questions ("what did we
+            # emit?" vs "what should we route to?"), so the volume-free one
+            # gets its own line rather than being inferred from the table.
+            intensity_rank = sorted(rows, key=lambda r: r["intensity"])
+            lines.append(fit_list(
+                "\u2696\uFE0F **Per Mtok** (volume-free): ",
+                ["{} {:,.0f} g".format(r["p"].name, r["intensity"])
+                 for r in intensity_rank]))
+            # Lowest first, because the question is "what is the least
+            # waste a dollar can make", and omitting the undefined rows beats
+            # printing a 0 that reads as "perfectly clean".
+            priced = [r for r in rows if r["per_dollar"] is not None]
+            if priced:
+                def gpd(v):
+                    if v >= 1000:
+                        return "{:,.1f}k".format(v / 1000)
+                    return "{:,.0f}".format(v) if v >= 1 else "<1"
+                lines.append(fit_list(
+                    "\U0001F4B5 **Per $** (lower better): ",
+                    ["{} {}".format(r["p"].name, gpd(r["per_dollar"]))
+                     for r in sorted(priced, key=lambda r: r["per_dollar"])],
+                    suffix=" g"))
+            lines.append(
+                "   _Order-of-magnitude: grid per provider, non-reasoning "
+                "baseline, location-based (not REC-adjusted). Tune in .env._")
         if AMORTIZE_TRAINING and train_co2_g_total > 0:
+            # No everyday equivalent here on purpose: the carbon line above
+            # already anchors the reader, and repeating it would spend ~35 of
+            # the ~90 characters of headroom this message has left.
             lines.append(
-                f"  **+ amortized training (rough)**: ≈ {train_co2_g_total:.0f} g CO₂e — "
-                f"embodied training carbon over a ~{MODEL_LIFETIME_TOKENS / 1e12:.0f}T-token "
-                # Backticks are load-bearing: Slack mrkdwn and Discord both read a
-                # bare underscore as an italics delimiter, so this one pairs with
-                # a marker elsewhere in the message and both vanish, printing
-                # "AMORTIZETRAINING". Seen live in the Discord bot on 2026-11-08.
-                f"lifespan (squishiest estimate here; `AMORTIZE_TRAINING=0` to hide)."
-            )
+                "   **+ amortized training**: \u2248 {} CO2e over a \u2248{:.0f}T-token "
+                # Backticks are load-bearing: Discord reads a bare
+                # underscore as an italics delimiter, and this one paired with
+                # the marker on a later line, eating BOTH and rendering
+                # "AMORTIZETRAINING". Any identifier with an underscore that
+                # reaches Discord needs a code span.
+                "lifespan — squishiest estimate here; `AMORTIZE_TRAINING=0` "
+                "to hide.".format(mass(train_co2_g_total),
+                               MODEL_LIFETIME_TOKENS / 1e12))
+
+        # Who chose what got billed. The rankings above are volume x intensity
+        # and say nothing about whether anyone MEANT to send that volume -- a
+        # head the router keeps picking is a routing decision to revisit, while
+        # the same tokens chosen by hand are just what you wanted. Shares are
+        # of the ATTRIBUTED subset: tokens billed before this counter existed
+        # are reported as unattributed rather than silently folded into "auto".
+        attributed = {}
+        for r in rows:
+            for m, n in (r["p"].total_tokens_by_selection or {}).items():
+                attributed[m] = attributed.get(m, 0) + n
+        attr_total = sum(attributed.values())
+        if attr_total > 0:
+            parts = " \u00b7 ".join(
+                "{} {:.0f}%".format(SELECTION_LABELS.get(m, m),
+                                    attributed[m] / attr_total * 100)
+                for m in SELECTION_MODES if attributed.get(m))
+            all_tokens = sum(r["in"] + r["cached"] + r["out"] for r in rows)
+            unattributed = max(0, all_tokens - attr_total)
+            tail = (" \u00b7 {} unattributed".format(_compact_tokens(unattributed))
+                    if unattributed else "")
+            lines.append("\U0001F3B2 **Chosen by**: " + parts + tail)
+
+        # Per-provider detail used to live here and no longer does. It
+        # costs ~115 characters a provider, so the eight-head fleet could not
+        # fit it beside the rankings and it was being trimmed away -- and a
+        # section that silently shrinks is worse than one you ask for.
+        # !costdetail gets a message of its own (sent through the chunking
+        # path, so nothing is dropped however many heads are configured) and
+        # can answer about a single head.
+        lines.append("\U0001F4CB **Breakdown**: `!costdetail` "
+                     "(or `!costdetail claude` for one head)")
+        out = "\n".join(lines)
+        # Slack chunks instead of rejecting, so an over-length message is
+        # not fatal here -- but a chunk boundary inside the fenced table
+        # would render the remainder as code, and sharing Discord's budget
+        # keeps the ranking table in one chunk AND lets both repos run one
+        # harness. With Detail moved out this never fires in practice.
+        if len(out) > 1990:
+            # Drop whole LINES, never a character position: a positional cut
+            # can land between a "**" pair and orphan the delimiter, bolding
+            # everything after it (the same class of bug as the underscore
+            # that ate AMORTIZE_TRAINING). Every line here is internally
+            # balanced, so line-wise trimming keeps the markdown valid.
+            note = "   _(trimmed: {} line(s) over Discord's 2,000-char cap)_"
+            for keep in range(len(lines) - 1, 0, -1):
+                body = lines[:keep] + [note.format(len(lines) - keep)]
+                # A trim inside the ranking table leaves the fence open and
+                # renders everything after it as code.
+                if "\n".join(body).count("```") % 2:
+                    body.insert(keep, "```")
+                out = "\n".join(body)
+                if len(out) <= 1990:
+                    break
+        return out
+
+    def get_cost_detail(self, providers: list[ModelProvider],
+                        only: ModelProvider = None) -> str:
+        """Exact per-provider numbers behind !cost: tokens, hits, Wh, grid, $.
+
+        Its own command rather than a section of !cost. !cost is the SHAPE of
+        the answer -- two rankings, the totals, the intensities -- and has to
+        stay one scannable message; this is the precision half, and it grows
+        linearly with the fleet. Sent chunked, so it is never trimmed.
+        """
+        rows, gemini_live_storage = self._cost_rows(providers)
+        if only is not None:
+            rows = [r for r in rows if r["p"] is only]
+            if not rows:
+                return ("\U0001F4CB **{}**: nothing billed yet (no requests, "
+                        "no cache storage).".format(only.name))
+        if not rows:
+            return "\U0001F4B0 No API calls made yet."
+
+        # No name in the single-head header: the row below already names it,
+        # and saying it twice reads like two different figures.
+        lines = ["\U0001F4CB **Cost detail**" if only is not None
+                 else "\U0001F4CB **Per-provider cost detail**"]
+        for r in sorted(rows, key=lambda r: r["cost"] + r["storage"],
+                        reverse=True):
+            p = r["p"]
+            total_in = r["in"] + r["cached"]
+            hit = (r["cached"] / total_in * 100) if total_in else 0.0
+            cache_note = (", \U0001F7E2 {:,} cached ({:.0f}% hit)".format(
+                r["cached"], hit) if r["cached"] else "")
+            # Self-hosted / local backends bill electricity, not per token --
+            # show that instead of a $0.0000 that reads like "free". The
+            # energy figures still report (tokens are counted) on the
+            # self-host grid.
+            if p.cost_mode == "local":
+                cost_str = "local (no per-token $ \u2014 electricity only)"
+            elif p.cost_mode == "plan":
+                fee = (" \u2014 ${:.2f}/mo flat".format(p.plan_monthly_usd)
+                       if p.plan_monthly_usd else "")
+                cost_str = "prepaid plan (no per-token ${})".format(fee)
+            else:
+                cost_str = "${:.4f}".format(r["cost"])
+            if p.cost_mode != "local" and p.total_peak_surcharge > 0:
+                cost_str += " (incl. ${:.4f} peak-hour surcharge)".format(
+                    p.total_peak_surcharge)
+            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
+            # per CALL, not per token, so they are called out rather than
+            # hiding inside a $/token figure.
+            tool_calls = p.total_search_requests + p.total_fetch_requests
+            if tool_calls > 0:
+                bits = []
+                if p.total_search_requests:
+                    bits.append("{:,} search".format(p.total_search_requests))
+                if p.total_fetch_requests:
+                    bits.append("{:,} fetch".format(p.total_fetch_requests))
+                cost_str += " (incl. ${:.4f} for {} tool calls)".format(
+                    p.get_tool_request_cost(), " + ".join(bits))
+            grid = (p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
+                    else GRID_GCO2_PER_KWH)
+            lines.append(
+                "  **{}**: {} requests, {:,} in + {:,} out{} = {} "
+                "\u00b7 {:.1f} Wh, {} CO2e (grid \u2248 {:.0f})".format(
+                    p.name, p.total_requests, r["in"], r["out"], cache_note,
+                    cost_str, r["energy"], _mass_co2(r["co2"]), grid))
+            if r["storage"] > 0:
+                live = (", ${:.4f} still accruing on a live cache".format(
+                    gemini_live_storage)
+                    if p.name == "Gemini" and gemini_live_storage > 0 else "")
+                lines.append(
+                    "      \u23F3 + \u2248${:.4f} Gemini cache storage "
+                    "(time-based, per token-hour{})".format(r["storage"], live))
+        if only is None:
+            lines.append("\U0001F4B0 **Rankings, totals and carbon**: `!cost`")
         return "\n".join(lines)
-    
+
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
         data = {
@@ -3722,8 +4118,13 @@ Return one JSON object only:
         # Select which model responds (forced or auto)
         if forced_provider:
             provider = forced_provider
+            # A bare prefix (!claude, !dummy, ...) is the clearest override
+            # there is: the user named the head for this single turn.
+            _SELECTION_MODE.set("override")
         else:
-            provider, routing_reason = await self._select_model(message, self._mem_key(message.channel.id))
+            provider, routing_reason, selection_mode = await self._select_model(
+                message, self._mem_key(message.channel.id))
+            _SELECTION_MODE.set(selection_mode)
         if participation.unsolicited:
             routing_reason = (
                 routing_reason + f" Ambient participation approved ({participation.reason})."
@@ -5383,13 +5784,22 @@ Return one JSON object only:
         Lower = cheaper = preferred when scores are tied."""
         return (provider.input_cost_per_million + provider.output_cost_per_million) / 2
 
-    async def _select_model(self, message: discord.Message, guild_id: int) -> tuple[ModelProvider, str]:
+    async def _select_model(
+        self, message: discord.Message, guild_id: int,
+    ) -> tuple[ModelProvider, str, str]:
         """Select which model should respond to this message.
-        Returns (provider, routing_reason) tuple."""
+
+        Returns (provider, routing_reason, selection_mode). The third element
+        feeds _SELECTION_MODE / !cost and says WHO decided: "auto" when the
+        confidence heuristic picked (or when there was nothing to pick from),
+        "override" when a human pinned it -- a !prefer channel preference or
+        the operator's config default_model. A bare !claude-style prefix never
+        reaches here; its caller sets "override" directly."""
         enabled = [p for p in self.providers if p.enabled]
         if not enabled:
             # Shouldn't happen — on_message gates earlier — but fail gracefully.
-            return self.claude_provider, "No providers enabled; defaulting to Claude."
+            return (self.claude_provider,
+                    "No providers enabled; defaulting to Claude.", "auto")
 
         # Hard rule: images require a vision-capable provider. Filter the pool
         # down to vision-capable providers and let normal scoring pick among them.
@@ -5420,7 +5830,7 @@ Return one JSON object only:
         # len>1 here and the auto_pool filter below keeps sim out of the argmax.
         if len(enabled) == 1:
             only = enabled[0]
-            return only, f"Only {only.name} is available{vision_routing_note}."
+            return only, f"Only {only.name} is available{vision_routing_note}.", "auto"
 
         # User preference for this channel?
         channel_id = message.channel.id
@@ -5432,12 +5842,16 @@ Return one JSON object only:
         pref_map = {p.id: p for p in self.providers}
         if pref in pref_map and pref_map[pref] in enabled:
             chosen = pref_map[pref]
-            return chosen, f"User set channel preference to {chosen.name} (!prefer {pref}).{vision_routing_note}"
+            return (chosen,
+                    f"User set channel preference to {chosen.name} "
+                    f"(!prefer {pref}).{vision_routing_note}", "override")
 
         # Global default override?
         if CONFIG.default_model in pref_map and pref_map[CONFIG.default_model] in enabled:
             chosen = pref_map[CONFIG.default_model]
-            return chosen, f"Global default model is set to {chosen.name}.{vision_routing_note}"
+            return (chosen,
+                    f"Global default model is set to "
+                    f"{chosen.name}.{vision_routing_note}", "override")
 
         # Auto-select via confidence heuristic — three-way argmax with a
         # cost-based tiebreak (cheaper wins ties). The scoring functions
@@ -5462,7 +5876,7 @@ Return one JSON object only:
             f"Auto-routed by heuristic: {score_str}. {winner.name} wins "
             f"(cost-based tiebreak applies on ties).{vision_routing_note}"
         )
-        return winner, reason
+        return winner, reason, "auto"
 
     async def _generate_openai_compatible_response(
         self,
@@ -6768,7 +7182,21 @@ Return one JSON object only:
         except anthropic.APIError as e:
             return f"Claude Error: {e}", [], ""
 
-    async def _panel_complete(
+    async def _panel_complete(self, *args, **kwargs) -> str:
+        """Bill a panel member / judge / recap as machinery, then restore.
+
+        Thin wrapper around _panel_complete_dispatch (the original body;
+        callers are unchanged). The reset is load-bearing: this is called from
+        inside a chat turn that already set its own selection mode, and a bare
+        set() would leak for the remainder of that asyncio Task.
+        """
+        tok = _SELECTION_MODE.set("system")
+        try:
+            return await self._panel_complete_dispatch(*args, **kwargs)
+        finally:
+            _SELECTION_MODE.reset(tok)
+
+    async def _panel_complete_dispatch(
         self,
         provider: ModelProvider,
         guild_id: int,
@@ -7702,6 +8130,33 @@ Return one JSON object only:
         cleaned = self.FRENCH_MARKER_RE.sub(lambda m: m.group(1).strip(), ''.join(out))
         return cleaned, files
 
+    def _resolve_usage_provider(self, token: str):
+        """Find a billable provider from a word the user typed.
+
+        Accepts anything the router already accepts -- a canonical bare prefix
+        or the active theme's flavor alias (rei -> Qwen) -- plus the canonical
+        id/name/display name and an unambiguous prefix of it. The prefix match
+        is what makes non-routing pseudo-providers reachable: the Haiku
+        participation gate bills real money but has no alias, so "haiku" is
+        the only handle it has.
+        """
+        t = token.strip().lower().lstrip("!")
+        if not t:
+            return None
+        flag = self.alias_to_flag.get("!" + t)
+        if flag and flag != "think":
+            for p in self.usage_providers:
+                if p.id == flag:
+                    return p
+        for p in self.usage_providers:
+            if t in (p.id.lower(), p.name.lower(),
+                     (p.display_name or "").lower()):
+                return p
+        hits = [p for p in self.usage_providers
+                if p.name.lower().startswith(t)
+                or (p.display_name or "").lower().startswith(t)]
+        return hits[0] if len(hits) == 1 else None
+
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
         content = message.content.strip()
@@ -7722,6 +8177,28 @@ Return one JSON object only:
         elif cmd == "!cost":
             summary = self.manager.get_cost_summary(self.usage_providers)
             await message.channel.send(summary)
+
+        elif cmd in ("!costdetail", "!breakdown", "!detail"):
+            # Split out of !cost 2026-11-08 (ported from the Discord bot): the
+            # per-provider rows are the precision half of the answer and grew
+            # past what one message can hold beside the rankings. Re-split on
+            # maxsplit=1 so a multi-word name survives. channel.send converts
+            # Markdown and chunks, so this is never truncated.
+            bits = message.content.strip().split(maxsplit=1)
+            arg = bits[1].strip() if len(bits) > 1 else ""
+            only = None
+            if arg:
+                only = self._resolve_usage_provider(arg)
+                if only is None:
+                    await message.channel.send(
+                        "\u2753 No provider matches `{}`. Try: {}".format(
+                            arg[:40].replace("`", ""),
+                            " \u00b7 ".join(p.name
+                                            for p in self.usage_providers)))
+                    return
+            detail = self.manager.get_cost_detail(
+                self.usage_providers, only=only)
+            await message.channel.send(detail)
 
         elif cmd == "!presence":
             scope_id = str(self._participation_scope(message).id)
@@ -9013,6 +9490,7 @@ Return one JSON object only:
 **Commands:**
 `!context` - Show current context size and cost estimate
 `!cost` - Show total API usage and cost per model
+`!costdetail [provider]` - Exact per-provider numbers behind `!cost` (tokens, cache hits, Wh, grid)
 `!presence` - Show automatic session/ambient participation state and recent speakers
 `!presence auto|session|ambient|tags` - Override participation mode for this channel
 `!memories` - List all memories (both types)
