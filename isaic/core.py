@@ -754,7 +754,18 @@ CLAUDE_PROVIDER = ModelProvider(
     supports_vision=True,
     supports_web_search=True,
     est_wh_per_1k_tokens=0.6,  # large frontier model, but Anthropic ranks high on per-query efficiency
-    grid_gco2_per_kwh=250.0,   # AWS fleet: RECs + clean anchors (e.g. the PA nuclear Anthropic capacity)
+    # RAISED 250 -> 400 on 2026-11-07, mirroring Hydra. The old 250 rested on
+    # "RECs + clean anchors" -- MARKET-based accounting, while this field is
+    # defined as the intensity of the grid the endpoint PHYSICALLY runs on.
+    # Certificates do not move electrons. And the fleet moved the wrong way:
+    # 2026-05-06 Anthropic leased ALL of Colossus 1 (Memphis, 300+ MW, 220k+
+    # GPUs) from SpaceX to serve Claude Pro/Max -- inference, which is what
+    # this field prices -- and that site runs mostly on ~35 on-site
+    # simple-cycle methane turbines (~422 MW against a 15-turbine permit)
+    # topped up by TVA at ~327 g/kWh (721.69 lb/MWh, 2025 system average).
+    # 400 = the US average = our global fallback. If Memphis carries more of
+    # the serving load than the rest of the fleet, 400 is still LOW.
+    grid_gco2_per_kwh=400.0,
     train_tco2e=8000.0,        # undisclosed — order-of-magnitude estimate for an Opus-class US train
 )
 
@@ -813,7 +824,14 @@ DEEPSEEK_PROVIDER = ModelProvider(
     # Deepseek has no native web search; route through Tavily.
     search_backend="tavily",
     est_wh_per_1k_tokens=0.2,  # V4.1 Flash: 552B MoE, ~8B active in / ~16B out (V4 Pro ~49B → was 0.3)
-    grid_gco2_per_kwh=550.0,   # DeepSeek China API (east-CN grid; province-dependent — Sichuan hydro ~112, Inner Mongolia coal higher). fireworks backend → ~400; self-host → your grid
+    # China's grid is NOT a coal-grid figure any more -- the wind/solar/hydro
+    # build-out pulled the national average to ~530 g/kWh (MEE/NBS official,
+    # 2023), ~526 (Ember 2025), ~589 (IEA 2025). 550 sits mid-spread. So the
+    # honest gap to a US endpoint is ~1.3x, not the ~2x our old Claude figure
+    # implied. Still province-dependent (Sichuan hydro ~112, Inner Mongolia
+    # coal much higher) and east-CN runs above national average.
+    # fireworks backend -> ~400; self-host -> your grid.
+    grid_gco2_per_kwh=550.0,
     train_tco2e=1000.0,        # ~1.4 GWh for V3 (2.78M GPU-hrs); V4 est. — very training-efficient
     # Backend toggle (Phase 3). Default "api" (above) = China api.deepseek.com.
     # The Discord bot stays on "api" by design (CLAUDE.md locked deviation);
@@ -2757,7 +2775,10 @@ class IsaicBot:
             supports_vision=False,
             supports_web_search=False,
             est_wh_per_1k_tokens=0.2,
-            grid_gco2_per_kwh=250.0,
+            # Same Anthropic fleet as the chat head, so it inherits the same
+            # location-based figure (see CLAUDE_PROVIDER: 250 -> 400 on
+            # 2026-11-07, Colossus 1 / REC reasoning).
+            grid_gco2_per_kwh=400.0,
         )
         self.usage_providers = self.providers + [self.participation_usage]
         self._participation_seeded_sources: set[tuple[str, str]] = set()

@@ -181,6 +181,47 @@ continuity, 👍/👎 calibration, a file upload, `!load`, and one `!cost` showi
 cache hits climbing across consecutive turns. Expect small Slack-API edges on
 first contact.
 
+## Carbon constants: Anthropic's grid figure was market-based (2026-11-07)
+
+`!cost`'s per-provider `grid_gco2_per_kwh` is documented as the intensity of the
+grid a provider's endpoint **physically** runs on. Claude's was 250 g/kWh,
+justified in-comment as "AWS fleet: RECs + clean anchors" — which is
+**market**-based accounting. Renewable energy certificates are a financial
+instrument; they do not change which generators serve the load. So the premium
+head was being flattered by the standard our own field definition sets.
+
+Two facts make it worse rather than better:
+
+- **2026-05-06: Anthropic leased all of Colossus 1** — Memphis, TN, 300+ MW,
+  220k+ GPUs — from SpaceX, explicitly to serve Claude Pro and Max. That is
+  *inference* capacity, which is exactly what this field prices. Leased, not
+  bought.
+- **That site runs mostly on on-site methane.** Roughly 35 simple-cycle gas
+  turbines, about 422 MW, against a permit for 15 — the subject of a Clean Air
+  Act complaint and an NAACP/SELC suit — topped up by ~150–250 MW of TVA grid.
+  Simple-cycle gas is dirtier than the combined-cycle plants behind the IPCC AR5
+  lifecycle median of ~490 g/kWh, and TVA's own 2025 system average is 721.69
+  lb/MWh ≈ **327 g/kWh**.
+
+Anthropic's AWS Trainium and GCP TPU capacity is cleaner, and the blend is not
+knowable from outside, so the figure moves to **400 g/kWh** — the US average,
+which is also this bot's global fallback. The residual error has a known
+direction: if Memphis carries more of the serving load than the rest of the
+fleet, 400 is still low. The participation classifier runs on the same fleet and
+moves with it.
+
+The same sweep re-checked China, where the figure was *not* wrong. The
+wind/solar/hydro build-out has pulled the national average to ~530 g/kWh
+(MEE/NBS official, 2023), ~526 (Ember 2025) or ~589 (IEA 2025), so DeepSeek's
+550 stays. What was wrong was the **contrast**: 250-against-550 implied a ~2x
+gap between a US and a Chinese endpoint where the honest figure is ~1.3x.
+
+Not ported from the Discord bot: its ranked `!cost` layout and the volume-free
+`Per Mtok` line, which is where that repo surfaces the more interesting point —
+cumulative CO2e is *volume x intensity*, and volume is a routing artifact, so
+per token the premium head is the dirty one. This repo keeps the older
+registry-ordered summary for now.
+
 ## Fleet parity: DeepSeek vision, tool-cost bucket, field-map fix (2026-11-07)
 
 Three things the Discord bot had and this one didn't, plus one correction.
