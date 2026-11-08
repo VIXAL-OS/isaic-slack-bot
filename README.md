@@ -181,6 +181,51 @@ continuity, 👍/👎 calibration, a file upload, `!load`, and one `!cost` showi
 cache hits climbing across consecutive turns. Expect small Slack-API edges on
 first contact.
 
+## Images are only legal in user turns (2026-11-08)
+
+Fixed here after the sibling Discord bot hit it live: both its heads started
+400ing on *every* message in a channel, including a plain greeting with no
+image in it.
+
+```
+[Deepseek] 400 - Image in assistant message is not supported
+[Claude]   400 - messages.9.content: 'image' blocks are not permitted
+                 within assistant turns
+```
+
+The history builder appends an image block for any image attachment it finds,
+and roles each message by **author**:
+
+```python
+role = "assistant" if _is_real_bot(msg) else "user"
+```
+
+The bot's own messages are deliberately in history — that is how it sees what
+it said — so a bot message carrying an image becomes an illegal assistant image
+block, and from then on every turn in that channel fails until it scrolls out
+of the history window.
+
+It stayed latent because `_strip_images_from_messages` drops image content
+wholesale for `supports_vision=False` providers. That was an **accidental**
+shield, not a guard: it covered DeepSeek only while DeepSeek was text-only, and
+enabling its vision removed it. Claude never had it at all.
+
+The fix is one provider-agnostic invariant. `_strip_assistant_images(messages)`
+rewrites any image block in a non-user turn to a text placeholder and runs at
+the end of history assembly, so no route in survives; the attachment loop also
+skips the download for a bot message and records `[Image posted: <file>]`
+instead, saving a pointless fetch and the tokens the block would have cost. The
+constraint is universal rather than Anthropic-specific — Anthropic, DeepSeek
+and the OpenAI content-part schema all allow images in user content only — so
+the guard belongs in assembly, not in any one dispatch path.
+
+Nothing poisoned is persisted: history is re-fetched from the platform every
+turn, so a channel recovers as soon as the process reloads.
+
+Offline-validated: `scratchpad/test_assistant_images.py` (21/21 here, run with
+`BOT_MODULE=isaic.core`), including an end-to-end pass through the real history
+builder that reproduces the outage's shape.
+
 ## Carbon constants: Anthropic's grid figure was market-based (2026-11-07)
 
 `!cost`'s per-provider `grid_gco2_per_kwh` is documented as the intensity of the
