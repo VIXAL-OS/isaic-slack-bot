@@ -2585,7 +2585,11 @@ class ConversationManager:
             lines.append(
                 f"  **+ amortized training (rough)**: ≈ {train_co2_g_total:.0f} g CO₂e — "
                 f"embodied training carbon over a ~{MODEL_LIFETIME_TOKENS / 1e12:.0f}T-token "
-                f"lifespan (squishiest estimate here; AMORTIZE_TRAINING=0 to hide)."
+                # Backticks are load-bearing: Slack mrkdwn and Discord both read a
+                # bare underscore as an italics delimiter, so this one pairs with
+                # a marker elsewhere in the message and both vanish, printing
+                # "AMORTIZETRAINING". Seen live in the Discord bot on 2026-11-08.
+                f"lifespan (squishiest estimate here; `AMORTIZE_TRAINING=0` to hide)."
             )
         return "\n".join(lines)
     
