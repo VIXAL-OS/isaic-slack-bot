@@ -20,12 +20,42 @@ def response(text="A complete summary.", reason="end_turn"):
                        cache_read_input_tokens=20, cache_creation_input_tokens=0))
 
 
+
+class _StreamCM:
+    """Stand-in for the SDK's MessageStreamManager context manager."""
+
+    def __init__(self, message):
+        self._message = message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return self._message
+
+
 def fresh(responses):
     b = Bot.__new__(Bot)
     b.claude_provider = copy.deepcopy(module.CLAUDE_PROVIDER)
     b.claude_provider.enabled = True
     b.usage_providers = [b.claude_provider]
-    b.claude_client = NS(messages=NS(create=Mock(side_effect=responses)))
+    # ONE recorder for BOTH transports. The xhigh/max tier asks for 64k
+    # max_tokens, which _claude_message sends through messages.stream instead
+    # of messages.create (the SDK refuses that budget non-streaming). Routing
+    # the stream through the same Mock keeps every assertion below
+    # transport-agnostic, and .streamed records which calls took which path.
+    _api = Mock(side_effect=responses)
+    _streamed = []
+
+    def _stream(**kwargs):
+        _streamed.append(kwargs)
+        return _StreamCM(_api(**kwargs))
+
+    b.claude_client = NS(messages=NS(create=_api, stream=_stream,
+                                     streamed=_streamed))
     b.manager = NS(memories={1: NS(longterm=NS(add=Mock(return_value=True)),
                                  get_context_string=lambda: "")},
                    fetch_thread_history=AsyncMock(return_value=[{"role": "user", "content": "Please summarize."}]),
@@ -94,6 +124,11 @@ class Migration(unittest.TestCase):
                 self.assertEqual(len(calls), 2)
                 self.assertEqual(calls[0].kwargs["thinking"]["type"], "adaptive")
                 self.assertEqual(calls[0].kwargs["extra_body"]["output_config"]["effort"], effort or "low")
+                # And it went over the right transport: only the 64k tier may
+                # stream, and when it does BOTH requests must (the tool-loop
+                # continuation reuses the same kwargs).
+                self.assertEqual(len(b.claude_client.messages.streamed),
+                                 2 if effort in ("xhigh", "max") else 0)
                 self.assertIs(calls[1].kwargs["messages"][-2]["content"], first.content)
                 self.assertEqual(b.claude_provider.total_requests, 1)
                 self.assertEqual(b.claude_provider.total_output_tokens, 100)

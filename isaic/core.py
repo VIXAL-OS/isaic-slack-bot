@@ -3423,6 +3423,19 @@ class IsaicBot:
     CLAUDE_THINKING_MAX_TOKENS = 16000
     CLAUDE_PLAIN_EFFORT = "low"
     CLAUDE_PLAIN_MAX_TOKENS = 8192
+    # Above this, the SDK REFUSES a non-streaming request before it sends
+    # anything: _calculate_nonstreaming_timeout raises ValueError("Streaming
+    # is required for operations that may take longer than 10 minutes")
+    # whenever 3600 * max_tokens / 128_000 > 600 -- i.e. above 21,333 tokens.
+    # The xhigh/max tier asks for 64,000, three times the ceiling, so EVERY
+    # auto-escalated or !think Claude turn died there (live 2026-11-08
+    # 19:31:41, one lost Discord turn; 16,000 and 8,192 are both under it,
+    # which is why only the deepest tier broke). _claude_message streams past
+    # this line instead of creating. Verified against the INSTALLED SDK by
+    # scratchpad/test_claude_streaming.py, which calls that helper directly --
+    # so if a future SDK moves the boundary, the harness fails, not production.
+    CLAUDE_NONSTREAM_MAX_TOKENS = 21_333
+
 
     def _store_reasoning(self, msg_id: int, content: str) -> None:
         """Cache reasoning_content under a Discord message id (FIFO eviction)."""
@@ -6999,6 +7012,33 @@ Return one JSON object only:
             reading_material=reading_material,
         )
 
+    async def _claude_message(self, **kwargs):
+        """One Anthropic Messages call, streamed when the budget demands it.
+
+        Streaming is the documented way to ask for a large output budget: the
+        SDK will not take CLAUDE_NONSTREAM_MAX_TOKENS or more without it, and
+        our deepest effort tier asks for three times that. The stream's
+        .get_final_message() returns the same Message object the non-streaming
+        call would have returned, so usage accounting, the tool loop and the
+        content-block walk downstream are all untouched.
+
+        BOTH call sites in _generate_claude_response go through here, so the
+        tool-loop continuation can never drift from the first request -- and a
+        new Claude call site inherits the guard instead of rediscovering the
+        ten-minute rule in production, which is how this one was found.
+        """
+        if kwargs.get("max_tokens", 0) <= self.CLAUDE_NONSTREAM_MAX_TOKENS:
+            return await asyncio.to_thread(
+                self.claude_client.messages.create, **kwargs)
+
+        def _collect():
+            # Blocks in the worker thread until the stream completes, exactly
+            # like the create call it stands in for.
+            with self.claude_client.messages.stream(**kwargs) as stream:
+                return stream.get_final_message()
+
+        return await asyncio.to_thread(_collect)
+
     async def _generate_claude_response(
         self,
         guild_id: int,
@@ -7091,8 +7131,7 @@ Return one JSON object only:
                 claude_kwargs["extra_body"] = {"output_config": {"effort": self.CLAUDE_PLAIN_EFFORT}}
 
             api_messages = self._strip_internal_keys(messages)
-            response = await asyncio.to_thread(
-                self.claude_client.messages.create,
+            response = await self._claude_message(
                 messages=api_messages,
                 **claude_kwargs,
             )
@@ -7128,8 +7167,7 @@ Return one JSON object only:
                     }]
                 })
 
-                response = await asyncio.to_thread(
-                    self.claude_client.messages.create,
+                response = await self._claude_message(
                     messages=api_messages,
                     **claude_kwargs,
                 )

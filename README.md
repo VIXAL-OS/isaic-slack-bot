@@ -374,3 +374,20 @@ Offline-validated with `BOT_MODULE=isaic.core python scratchpad/test_cost_summar
 (90/90, including the tilde rule and an end-to-end pass through the real converter) and
 `scratchpad/test_selection_attribution.py` (35/35). As everywhere else in this checkout, no live
 Slack round-trip has run.
+
+## High-effort Claude turns must stream (2026-11-12)
+
+The Anthropic SDK refuses a **non-streaming** request whose `max_tokens` implies a worst case over
+ten minutes (`3600 * max_tokens / 128_000 > 600`, i.e. above 21,333 tokens) and raises
+`ValueError: Streaming is required for operations that may take longer than 10 minutes` *before
+sending anything*. The `xhigh`/`max` effort tier asks for 64,000, three times that ceiling, so every
+auto-escalated or `!think` Claude turn failed with nothing billed and no trace in `!cost`.
+
+`_claude_message()` is now the single entry point: it streams above `CLAUDE_NONSTREAM_MAX_TOKENS`
+and creates below it, and `stream.get_final_message()` returns the same `Message` object, so usage
+accounting and the tool loop are unchanged. Both call sites in `_generate_claude_response` — the
+first request and the tool-loop continuation, which shares its kwargs — go through it. **Never
+call `self.claude_client.messages.create` directly on the chat path.**
+
+Offline-validated with `BOT_MODULE=isaic.core python scratchpad/test_claude_streaming.py` (22/22),
+which pins the boundary against the installed SDK rather than against arithmetic in a comment.
